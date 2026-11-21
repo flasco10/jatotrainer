@@ -1,3 +1,6 @@
+build-tools/
+installer-output/
+[Bb]in/
 [Oo]bj/
 
 # Byte-compiled / optimized / DLL files
