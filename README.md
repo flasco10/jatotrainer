@@ -80,16 +80,6 @@ Run `python -m unittest -v test_ui` in a desktop session (or using xvfb-run
 on Linux) for real-widget layout and interaction checks.
 Windows packaging and install/uninstall must be validated on Windows.
 
-## DanOverlay website-inspired style
-
-Version 1.1 adopts the requested website styling: almost-black surfaces,
-blue-violet accents, rounded pill navigation and main action, thin outlined
-cards, bold two-line hero type, and colored live chart/rate badges. Manual
-selection stays in the collapsible sidebar; logs still expand downward.
-The conversion backend and installer workflow are unchanged. This uses the
-website as visual inspiration; it does not import DanOverlay artwork, rankings,
-or estimation functionality. Reference: https://danoverlay.pages.dev/
-
 ## Custom chart card and OD
 
 The chart card follows the supplied mockup: title, mapper, difficulty, blue
