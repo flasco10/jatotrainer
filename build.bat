@@ -15,7 +15,7 @@ set "MSYSTEM=UCRT64"
 set "CHERE_INVOKING=1"
 "%JATO_MSYS2%\usr\bin\bash.exe" -lc "bash ./build_ffmpeg.sh"
 if errorlevel 1 goto :err
-dotnet publish native\OsuReader.csproj -c Release -r win-x64 --self-contained true -p:GeneratePackageOnBuild=false -o build-tools\reader
+dotnet publish native\OsuReader.csproj -c Release -r win-x64 --self-contained true -p:GeneratePackageOnBuild=false -o build-tools\reader --source https://api.nuget.org/v3/index.json
 if errorlevel 1 goto :err
 build-tools\reader\Jatotrainer.OsuReader.exe --self-test
 if errorlevel 1 goto :err
