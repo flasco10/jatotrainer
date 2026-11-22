@@ -1,14 +1,18 @@
-# jatotrainer
+# Jatotrainer Features
 
-A desktop trainer for generating osu!mania rate charts.
+Jatotrainer is a Windows tool for osu!mania. Generate several rates of a chart in one pass, build a custom practice pack, or convert charts between osu!mania and StepMania.
+
+- **Batch rates:** Generate multiple rates at once, with preview points, Kiai timing, bookmarks, and BPM adjusted for each rate.
+- **Practice settings:** Customize difficulty names and OD, and choose whether pitch changes with the rate or stays the same.
+- **Chart selection:** Browse your Songs folder, follow the selected chart in osu!stable without requiring tosu, or use Compact Mode for quick conversions.
+- **Pack Maker:** Combine charts into a practice pack, choose rates per chart, and reduce pack size with audio and background compression.
+- **(BETA) StepMania conversion:** Convert individual charts or whole packs between osu!mania and StepMania, with timing checks and logs for unsupported features.
+
+# Compact mode
+
+- Transforms the app into a small compact window for the rate changer
 
 ## Build the Windows x64 installer
-
-The finished installer bundles the osu!stable reader, its .NET runtime and
-FFmpeg. Players only install Jatotrainer; they do not need StreamCompanion,
-FFmpeg, .NET, Python or MSYS2 separately.
-
-For the person building the installer:
 
 1. Install [64-bit Python 3.11 or newer](https://www.python.org/downloads/windows/)
    with Python on PATH, the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0),
@@ -33,17 +37,3 @@ run `python -m pip install -r requirements.txt` and `python jatotrainer.py`.
 
 The combined distribution is GPLv3 or later. Historical MIT notices and
 third-party licenses are retained; see `THIRD_PARTY.md`.
-
-# Jatotrainer Features
-
-Jatotrainer is a Windows tool for osu!mania. Generate several rates of a chart in one pass, build a custom practice pack, or convert charts between osu!mania and StepMania.
-
-- **Batch rates:** Generate multiple rates at once, with preview points, Kiai timing, bookmarks, and BPM adjusted for each rate.
-- **Practice settings:** Customize difficulty names and OD, and choose whether pitch changes with the rate or stays the same.
-- **Chart selection:** Browse your Songs folder, follow the selected chart in osu!stable without requiring tosu, or use Compact Mode for quick conversions.
-- **Pack Maker:** Combine charts into a practice pack, choose rates per chart, and reduce pack size with audio and background compression.
-- **(BETA) StepMania conversion:** Convert individual charts or whole packs between osu!mania and StepMania, with timing checks and logs for unsupported features.
-
-# Compact mode
-
-- Transforms the app into a small compact window for the rate changer
