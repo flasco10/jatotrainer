@@ -43,3 +43,7 @@ Jatotrainer is a Windows tool for osu!mania. Generate several rates of a chart i
 - **Chart selection:** Browse your Songs folder, follow the selected chart in osu!stable without requiring tosu, or use Compact Mode for quick conversions.
 - **Pack Maker:** Combine charts into a practice pack, choose rates per chart, and reduce pack size with audio and background compression.
 - **(BETA) StepMania conversion:** Convert individual charts or whole packs between osu!mania and StepMania, with timing checks and logs for unsupported features.
+
+# Compact mode
+
+- Transforms the app into a small compact window for the rate changer
