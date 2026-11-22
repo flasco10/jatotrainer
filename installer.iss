@@ -1,5 +1,8 @@
 #define AppName "jatotrainer"
-#define AppVersion "1.5.0"
+; CI passes /DAppVersion=<tag>; local builds use this default.
+#ifndef AppVersion
+  #define AppVersion "1.5.0"
+#endif
 
 [Setup]
 AppId={{7C6A5D83-BAC3-41AA-BAA4-D6382FC1D287}

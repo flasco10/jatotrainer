@@ -27,6 +27,21 @@ For the person building the installer:
    Keep the source available for that exact binary release. Do the same for any
    portable binaries (`build.bat`, then `python source_release.py`).
 
+### Releasing with GitHub Actions
+
+`.github/workflows/release.yml` does all of the above on a clean Windows runner,
+so nothing needs to be installed locally. Push a version tag to publish a
+GitHub Release with the installer, the portable zip and the source zip:
+
+```sh
+git tag v1.6.0
+git push origin v1.6.0
+```
+
+The tag sets the installer version (`v1.6.0` → `1.6.0`). To get the files
+without publishing, run the workflow from the repository's **Actions** tab and
+download them from the run's artifacts.
+
 The installer is unsigned and installs per user. Keep the whole
 `dist/jatotrainer` folder together for a portable build. For Python development,
 run `python -m pip install -r requirements.txt` and `python jatotrainer.py`.

@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, ttk
 
@@ -39,6 +40,9 @@ BG_MAIN = "#080a12"
 
 LIST_LIMIT = 3000  # max rows shown in the list (search/auto-select narrows it)
 DEFAULT_FORMAT = "{diff} ({rate}x)"
+# osu! ranking criteria cap MP3 at 192 kbps; higher bitrates bloat uploads past Bancho's size limit.
+DEFAULT_BITRATE = 192
+BITRATES = (128, 192, 256, 320)
 FORMAT_PRESETS = [
     "{diff} x{rate} [{bpm}]",
     "{diff} x{rate}",
@@ -49,7 +53,8 @@ FORMAT_PRESETS = [
     "{diff} - {rate}x ({bpm}bpm)",
     "{diff} {pct}%",
 ]
-QUICK_RATES = [f"{x / 100:g}" for x in range(85, 141, 5) if x != 100]  # 0.85 ... 1.4 in 0.05 steps (1.0 = original)
+# 0.8-1.5 in 0.05 steps where most practice happens, then 0.1 steps up to 2.0 (1.0 = original).
+QUICK_RATES = [f"{x / 100:g}" for x in [*range(80, 151, 5), *range(160, 201, 10)] if x != 100]
 
 
 # --------------------------------------------------------------------------- #
@@ -786,7 +791,7 @@ def _migrate_audio_sidecars(folder, log):
     log(f"        migrated {len(migrated)} audio record(s) to the user cache")
 
 
-def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp_override=None, result=None):
+def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp_override=None, result=None, bitrate=DEFAULT_BITRATE):
     path = info["path"]
     folder = os.path.dirname(os.path.abspath(path))
     header, sections = parse_osu(path)
@@ -816,54 +821,80 @@ def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp
     _migrate_audio_sidecars(folder, log)
     audio_records = _load_audio_cache()
     source_hash = _file_digest(src_a)
-    for rate in rates:
-        identity = f"mmr-audio-v3-cbr320:{source_hash}:{repr(rate)}:{bool(pitch)}"
-        original_stem = os.path.splitext(re.split(r"[/\\]", audio)[-1])[0]
-        audio_stem = safe_name(original_stem)[:140] or "audio"
-        preferred_audio = f"{audio_stem} x{fmt_rate(rate)} mmr"
-        # Readable names can collide between pitch modes, source revisions,
-        # or different source extensions. Verify each candidate before reuse.
-        for number in range(100000):
-            suffix = "" if number == 0 else f" ({number + 1})"
-            new_audio = f"{preferred_audio}{suffix}.mp3"
-            dst_a = os.path.join(folder, new_audio)
-            manifest_path = dst_a + ".json"
-            manifest = audio_records.get(_audio_cache_key(dst_a), {})
-            reusable = _verified_audio_record(dst_a, manifest, identity)
-            if reusable or not (os.path.exists(dst_a) or os.path.exists(manifest_path)):
-                break
-        else:
-            raise RuntimeError("Too many audio filename collisions")
-        text, ver, _, _ = build_rate(header, sections, rate, fmt, od_flag, new_audio, od_override, hp_override)
-        filename = safe_name(f"{info['artist']} - {info['title']} ({info['creator']}) [{ver}]")[:160]
-        fname = f"{filename} [mmr-x{fmt_rate(rate)}].osu"
-        if reusable:
-            log("        verified audio already exists, reused")
-        else:
-            if not ffmpeg:
-                raise RuntimeError("FFmpeg not found. Install FFmpeg and add it to PATH, then restart Jatotrainer. No beatmap was written.")
-            fd, temporary = tempfile.mkstemp(prefix=".mmr-", suffix=".mp3", dir=folder)
-            os.close(fd)
-            try:
-                make_audio(ffmpeg, src_a, temporary, rate, pitch)
-                # Exclusive creation protects files created since the check.
-                with open(temporary, "rb") as src, open(dst_a, "xb") as dst:
-                    shutil.copyfileobj(src, dst)
-                record = {"identity": identity, "sha256": _file_digest(dst_a)}
-                _save_audio_records({_audio_cache_key(dst_a): record})
-                audio_records[_audio_cache_key(dst_a)] = record
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            log(f"        audio -> {new_audio}")
-        published, created = _publish_unique(folder, fname, text)
-        log(f"[{fmt_rate(rate)}x] {'wrote' if created else 'already exists'} {published}")
-        output_path = os.path.join(folder, published)
-        if not os.path.isfile(output_path) or not os.path.isfile(dst_a):
-            raise RuntimeError("Output chart or audio is missing after conversion")
-        if result is not None:
-            result(dict(path=output_path, version=ver, rate=rate, created=created, audio=dst_a))
-        yield rate
+
+    def identity_for(rate):
+        return f"mmr-audio-v3-cbr{bitrate}:{source_hash}:{repr(rate)}:{bool(pitch)}"
+
+    # MP3 encoding is single-threaded, so start every new rate's encode up front
+    # and let the loop below publish them in order as each one finishes.
+    pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 1) if ffmpeg else None
+    jobs = {}
+
+    def start_encode(rate):
+        fd, temporary = tempfile.mkstemp(prefix=".mmr-", suffix=".mp3", dir=folder)
+        os.close(fd)
+        return temporary, pool.submit(make_audio, ffmpeg, src_a, temporary, rate, pitch, bitrate=bitrate)
+
+    try:
+        known = {record.get("identity") for record in audio_records.values()}
+        if pool:
+            jobs = {rate: start_encode(rate) for rate in rates if identity_for(rate) not in known}
+        for rate in rates:
+            identity = identity_for(rate)
+            original_stem = os.path.splitext(re.split(r"[/\\]", audio)[-1])[0]
+            audio_stem = safe_name(original_stem)[:140] or "audio"
+            preferred_audio = f"{audio_stem} x{fmt_rate(rate)} mmr"
+            # Readable names can collide between pitch modes, source revisions,
+            # or different source extensions. Verify each candidate before reuse.
+            for number in range(100000):
+                suffix = "" if number == 0 else f" ({number + 1})"
+                new_audio = f"{preferred_audio}{suffix}.mp3"
+                dst_a = os.path.join(folder, new_audio)
+                manifest_path = dst_a + ".json"
+                manifest = audio_records.get(_audio_cache_key(dst_a), {})
+                reusable = _verified_audio_record(dst_a, manifest, identity)
+                if reusable or not (os.path.exists(dst_a) or os.path.exists(manifest_path)):
+                    break
+            else:
+                raise RuntimeError("Too many audio filename collisions")
+            text, ver, _, _ = build_rate(header, sections, rate, fmt, od_flag, new_audio, od_override, hp_override)
+            filename = safe_name(f"{info['artist']} - {info['title']} ({info['creator']}) [{ver}]")[:160]
+            fname = f"{filename} [mmr-x{fmt_rate(rate)}].osu"
+            if reusable:
+                log("        verified audio already exists, reused")
+            else:
+                if not ffmpeg:
+                    raise RuntimeError("FFmpeg not found. Install FFmpeg and add it to PATH, then restart Jatotrainer. No beatmap was written.")
+                # A cached record that failed verification has no prestarted job.
+                temporary, job = jobs.pop(rate, None) or start_encode(rate)
+                try:
+                    job.result()
+                    # Exclusive creation protects files created since the check.
+                    with open(temporary, "rb") as src, open(dst_a, "xb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    record = {"identity": identity, "sha256": _file_digest(dst_a)}
+                    _save_audio_records({_audio_cache_key(dst_a): record})
+                    audio_records[_audio_cache_key(dst_a)] = record
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+                log(f"        audio -> {new_audio}")
+            published, created = _publish_unique(folder, fname, text)
+            log(f"[{fmt_rate(rate)}x] {'wrote' if created else 'already exists'} {published}")
+            output_path = os.path.join(folder, published)
+            if not os.path.isfile(output_path) or not os.path.isfile(dst_a):
+                raise RuntimeError("Output chart or audio is missing after conversion")
+            if result is not None:
+                result(dict(path=output_path, version=ver, rate=rate, created=created, audio=dst_a))
+            yield rate
+    finally:
+        for _, job in jobs.values():
+            job.cancel()
+        if pool:
+            pool.shutdown(wait=True)
+        for temporary, _ in jobs.values():
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 # --------------------------------------------------------------------------- #
@@ -1188,12 +1219,29 @@ class App(ctk.CTk):
         for i, r in enumerate(QUICK_RATES):
             b = ctk.CTkButton(chips, text=f"{r}x", width=56, height=28, fg_color="#171c2c",
                               hover_color="#242d45", command=lambda r=r: self.toggle_rate(r))
-            b.grid(row=i // 6, column=i % 6, padx=3, pady=3)
+            b.grid(row=i // 7, column=i % 7, padx=3, pady=3)
             self.chip_btns[r] = b
-        self.rates_var = tk.StringVar(value="1.1, 1.2, 1.3")
+        self.rates_var = tk.StringVar(value=self.cfg.get("rates", "1.1, 1.2, 1.3"))
         self.rates_var.trace_add("write", lambda *_: self.on_options_changed())
-        ctk.CTkEntry(right, textvariable=self.rates_var, height=34,
-                     placeholder_text="e.g. 1.1, 1.25, 1.35").grid(row=4, column=0, sticky="ew", padx=18, pady=(4, 10))
+        rate_box = ctk.CTkFrame(right, fg_color="transparent")
+        rate_box.grid(row=4, column=0, sticky="ew", padx=18, pady=(4, 10))
+        rate_box.grid_columnconfigure(1, weight=1)
+        # Slider for in-between rates like 1.65 or 1.75; typing still accepts 0.1-5.
+        self.rate_slider_value = 1.25
+        self.rate_slider = ctk.CTkSlider(rate_box, from_=0.5, to=2, number_of_steps=150, progress_color=ACCENT,
+                                         command=self._on_rate_slider)
+        self.rate_slider.set(self.rate_slider_value)
+        self.rate_slider.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self.rate_slider_label = ctk.CTkLabel(rate_box, text="", width=130, anchor="e",
+                                              font=ctk.CTkFont(family="Poppins", size=13, weight="bold"))
+        self.rate_slider_label.grid(row=0, column=2, padx=(8, 6))
+        ctk.CTkButton(rate_box, text="+ Add", width=60, height=28, fg_color="#171c2c", hover_color="#242d45",
+                      command=self.add_slider_rate).grid(row=0, column=3)
+        ctk.CTkEntry(rate_box, textvariable=self.rates_var, height=34,
+                     placeholder_text="e.g. 1.1, 1.25, 1.35").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.rates_warning = ctk.CTkLabel(rate_box, text="", text_color="#f5a524", anchor="w", justify="left",
+                                          font=ctk.CTkFont(family="Poppins", size=11))
+        self.rates_warning.grid(row=2, column=0, columnspan=4, sticky="w")
 
         ctk.CTkLabel(right, text="DIFFICULTY NAME FORMAT", anchor="w", text_color="#8888a0",
                      font=ctk.CTkFont(family="Poppins", size=11, weight="bold")).grid(row=5, column=0, sticky="ew", padx=18)
@@ -1232,6 +1280,19 @@ class App(ctk.CTk):
         self.od_override_enabled.trace_add("write", lambda *_: self.on_options_changed())
         self.od_override_value.trace_add("write", lambda *_: self.on_options_changed())
         self.od_var.trace_add("write", lambda *_: self.on_options_changed())
+
+        brrow = ctk.CTkFrame(opts, fg_color="transparent")
+        brrow.pack(anchor="w", fill="x", pady=(8, 2))
+        saved = self.cfg.get("bitrate", DEFAULT_BITRATE)
+        self.bitrate_var = tk.StringVar(value=f"{saved if saved in BITRATES else DEFAULT_BITRATE} kbps")
+        ctk.CTkLabel(brrow, text="Audio bitrate").pack(side="left", padx=(0, 12))
+        ctk.CTkOptionMenu(brrow, values=[f"{b} kbps" for b in BITRATES], variable=self.bitrate_var, width=110,
+                          fg_color="#171c2c", button_color="#242d45").pack(side="left")
+        self.bitrate_warning = ctk.CTkLabel(opts, text="", text_color="#f5a524", anchor="w", justify="left",
+                                            wraplength=520, font=ctk.CTkFont(family="Poppins", size=11))
+        self.bitrate_warning.pack(anchor="w")
+        self.bitrate_var.trace_add("write", lambda *_: self._update_bitrate_warning())
+        self._update_bitrate_warning()
 
         self.gen_btn = ctk.CTkButton(self.conversion_dock, text="Convert charts", height=44, corner_radius=22, border_width=1, border_color="#78a8ff", fg_color=ACCENT,
                                      hover_color=ACCENT_HOVER, font=ctk.CTkFont(family="Poppins", size=15, weight="bold"),
@@ -1608,6 +1669,8 @@ class App(ctk.CTk):
         rate_y = label_y + 28
         rows = max(1, math.ceil(len(rates) / columns)) if rates else 0
         h = rate_y + (rows-1)*48 + 38 + 18 if rates else label_y+38
+        # Fixed 16:9 like osu! backgrounds; grow taller only if the content would not fit.
+        h = max(h, round(w * 9 / 16))
         c.configure(height=h)
         image = Image.new("RGB", (w, h), "#171d30")
         if self.background_image is not None:
@@ -1624,7 +1687,10 @@ class App(ctk.CTk):
                       fill="#eeeaf4",anchor="ne",font=("Poppins",13))
         if m:
             x=22
-            badge_font=tkfont.Font(family="Poppins",size=14,weight="bold")
+            # Created once: a Font per redraw gets garbage-collected on worker threads, which blocks on Tk.
+            if not hasattr(self, "_badge_font"):
+                self._badge_font = tkfont.Font(family="Poppins", size=14, weight="bold")
+            badge_font = self._badge_font
             card_od = str(m['od'])
             if hasattr(self, "od_override_enabled") and self.od_override_enabled.get():
                 try:
@@ -1649,8 +1715,9 @@ class App(ctk.CTk):
         cur = [x for x in cur if abs(x - val) > 1e-9] if any(abs(x - val) < 1e-9 for x in cur) else sorted(cur + [val])
         self.rates_var.set(", ".join(fmt_rate(x) for x in cur))
 
-    def parse_rates(self, silent=False):
-        out = []
+    def _split_rates(self):
+        """Return (valid rates, ignored tokens) from the rates box."""
+        out, ignored = [], []
         for tok in re.split(r"[,\s;]+", self.rates_var.get().strip()):
             if not tok:
                 continue
@@ -1658,12 +1725,40 @@ class App(ctk.CTk):
                 v = float(tok.rstrip("xX"))
                 if 0.1 <= v <= 5 and abs(v - 1) > 1e-9:
                     out.append(v)
+                    continue
             except ValueError:
                 pass
-        return list(dict.fromkeys(out))
+            ignored.append(tok)
+        return list(dict.fromkeys(out)), ignored
+
+    def parse_rates(self, silent=False):
+        return self._split_rates()[0]
+
+    def _on_rate_slider(self, value):
+        self.rate_slider_value = round(value, 2)
+        self._update_rate_slider_label()
+
+    def _update_rate_slider_label(self):
+        r = self.rate_slider_value
+        bpm = f" · {round(float(self.selected['bpm']) * r)} BPM" if self.selected else ""
+        self.rate_slider_label.configure(text=f"{fmt_rate(r)}×{bpm}")
+
+    def add_slider_rate(self):
+        rates = self.parse_rates(silent=True)
+        if abs(self.rate_slider_value - 1) > 1e-9 and not any(abs(x - self.rate_slider_value) < 1e-9 for x in rates):
+            self.rates_var.set(", ".join(fmt_rate(x) for x in sorted(rates + [self.rate_slider_value])))
+
+    def _bitrate(self):
+        return int(self.bitrate_var.get().split()[0])
+
+    def _update_bitrate_warning(self):
+        self.bitrate_warning.configure(text="Above 192 kbps breaks osu! ranking criteria and may make the map too large to upload to Bancho."
+                                       if self._bitrate() > DEFAULT_BITRATE else "")
 
     def on_options_changed(self):
-        rates = self.parse_rates(silent=True)
+        rates, ignored = self._split_rates()
+        self.rates_warning.configure(text=f"Ignored: {', '.join(ignored)} (rates must be 0.1–5 and not 1, use a dot for decimals)" if ignored else "")
+        self._update_rate_slider_label()
         self._draw_chart_card()
         for r, b in self.chip_btns.items():
             on = any(abs(x - float(r)) < 1e-9 for x in rates)
@@ -1688,7 +1783,7 @@ class App(ctk.CTk):
         if not rates or not m or self.busy:
             return
         override = self._od_override()
-        self.cfg.update(od_override_enabled=self.od_override_enabled.get(), od_override=self.od_override_value.get(), format=self.fmt_var.get(), pitch=self.pitch_var.get(), od=self.od_var.get())
+        self.cfg.update(od_override_enabled=self.od_override_enabled.get(), od_override=self.od_override_value.get(), format=self.fmt_var.get(), pitch=self.pitch_var.get(), od=self.od_var.get(), bitrate=self._bitrate(), rates=self.rates_var.get())
         save_json(CONFIG_PATH, self.cfg)
         self.busy = True
         self.gen_btn.configure(state="disabled", text="Converting…")
@@ -1697,12 +1792,12 @@ class App(ctk.CTk):
         if getattr(self, "compact_active", False):
             self.compact.refresh()
         hp = self.compact.hp_value if getattr(self, "compact_active", False) else None
-        fmt, pitch, odf, ff = self.fmt_var.get(), self.pitch_var.get(), self.od_var.get(), self.ffmpeg
+        fmt, pitch, odf, ff, br = self.fmt_var.get(), self.pitch_var.get(), self.od_var.get(), self.ffmpeg, self._bitrate()
 
         def work():
             outputs = []
             try:
-                for n, _ in enumerate(generate(m, rates, fmt, pitch, odf, lambda s: self.q.put(("log", s)), ff, override, hp, result=outputs.append), 1):
+                for n, _ in enumerate(generate(m, rates, fmt, pitch, odf, lambda s: self.q.put(("log", s)), ff, override, hp, result=outputs.append, bitrate=br), 1):
                     self.q.put(("prog", n / len(rates)))
                 self.q.put(("done", len(rates), outputs))
             except Exception as e:

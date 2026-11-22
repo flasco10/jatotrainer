@@ -1,0 +1,107 @@
+# Builds the portable zip, the installer and the GPL source zip.
+# Push a tag like v1.6.0 to publish a GitHub Release; run it by hand to just get the files.
+name: Build and release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $v = $env:GITHUB_REF_NAME -replace '^v', '' }
+          else { $v = "0.0.0-dev.$env:GITHUB_RUN_NUMBER" }
+          "value=$v" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            diffutils
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Build app (FFmpeg, osu! reader, PyInstaller)
+        shell: cmd
+        env:
+          JATO_MSYS2: ${{ steps.msys2.outputs.msys2-location }}
+          JATO_BUILD_JOBS: "4"
+        run: call build.bat --no-pause
+
+      - name: Run tests against the built FFmpeg
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          $env:PATH = "$PWD\build-tools\audio;$env:PATH"
+          python -m unittest test_conversion test_generation test_osu_reader test_pack
+
+      - name: Smoke-test the exe starts
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\jatotrainer\jatotrainer.exe -PassThru
+          Start-Sleep -Seconds 10
+          if ($p.HasExited) { throw "jatotrainer.exe exited early with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.value }}" installer.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Package portable zip and source zip
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.value }}"
+          Compress-Archive -Path dist\jatotrainer -DestinationPath "installer-output\jatotrainer-$v-portable.zip"
+          python source_release.py
+          Rename-Item installer-output\jatotrainer-Setup.exe "jatotrainer-$v-Setup.exe"
+          Rename-Item installer-output\jatotrainer-corresponding-source.zip "jatotrainer-$v-corresponding-source.zip"
+          Get-ChildItem installer-output | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jatotrainer-${{ steps.version.outputs.value }}
+          path: installer-output/*
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: jatotrainer ${{ steps.version.outputs.value }}
+          files: installer-output/*
+          fail_on_unmatched_files: true
+          body: |
+            - **jatotrainer-${{ steps.version.outputs.value }}-Setup.exe**: installer (per user, no admin needed)
+            - **jatotrainer-${{ steps.version.outputs.value }}-portable.zip**: unzip and run `jatotrainer\jatotrainer.exe`
+            - **jatotrainer-${{ steps.version.outputs.value }}-corresponding-source.zip**: GPL source for these binaries
+
+            The exe is unsigned, so Windows SmartScreen may warn: choose More info → Run anyway.

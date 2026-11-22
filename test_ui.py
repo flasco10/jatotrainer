@@ -21,6 +21,8 @@ class InterfaceTests(unittest.TestCase):
         for job in self.app.tk.call("after", "info"):
             self.app.tk.call("after", "cancel", job)
         self.app.destroy()
+        # Free the destroyed app's Tk fonts here; if a later test's worker thread collects them, it blocks on Tk.
+        import gc; gc.collect()
         self.config_patch.stop()
         self.tmp.cleanup()
     def pump(self):
@@ -28,6 +30,24 @@ class InterfaceTests(unittest.TestCase):
         while time.monotonic()<until:
             self.app.update()
             time.sleep(.01)
+    def test_rate_presets_slider_and_ignored_input(self):
+        a=self.app
+        self.assertEqual(j.QUICK_RATES[0],'0.8');self.assertEqual(j.QUICK_RATES[-1],'2')
+        a.rates_var.set('1.1');a._on_rate_slider(1.6499999);a.add_slider_rate();a.add_slider_rate()
+        self.assertEqual(a.rates_var.get(),'1.1, 1.65')
+        a._on_rate_slider(1.0);a.add_slider_rate()
+        self.assertEqual(a.rates_var.get(),'1.1, 1.65')
+        a.rates_var.set('1.2, abc, 7, 1')
+        self.assertEqual(a.parse_rates(),[1.2])
+        self.assertIn('abc, 7, 1',a.rates_warning.cget('text'))
+        a.rates_var.set('1.2, 1.3')
+        self.assertEqual(a.rates_warning.cget('text'),'')
+    def test_bitrate_defaults_to_192_and_warns_above(self):
+        self.assertEqual(self.app._bitrate(),192)
+        self.assertEqual(self.app.bitrate_warning.cget('text'),'')
+        self.app.bitrate_var.set('320 kbps')
+        self.assertEqual(self.app._bitrate(),320)
+        self.assertIn('Bancho',self.app.bitrate_warning.cget('text'))
     def test_compact_mode_controls_geometry_and_return(self):
         a = self.app
         a.selected = dict(path='sample.osu', title='Song', artist='Artist', creator='Charter', version='Hard', bpm=180, od='8', keys=4)
