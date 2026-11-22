@@ -1648,12 +1648,6 @@ class App(ctk.CTk):
             raise ValueError("OD must be between 0 and 10")
         return value
 
-    def _rounded_tile(self, x, y, x2, y2, fill, outline):
-        r=9
-        self.chart_canvas.create_polygon(x+r,y,x2-r,y,x2,y,x2,y+r,x2,y2-r,x2,y2,
-            x2-r,y2,x+r,y2,x,y2,x,y2-r,x,y+r,x,y, smooth=True,
-            fill=fill, outline=outline, width=2)
-
     def _draw_chart_card(self):
         from tkinter import font as tkfont
         c = self.chart_canvas
@@ -1666,16 +1660,18 @@ class App(ctk.CTk):
         title_item = c.create_text(22, 18, text=title, fill="white", anchor="nw",
                                    width=w-44, font=("Poppins", 24, "bold"))
         diff_y = c.bbox(title_item)[3] + 6
-        diff_item = c.create_text(22, diff_y,
-            text="‹ " + m["version"].strip(" <>‹›") + " ›" if m else "Your chart. Your pace.",
-            fill="white", anchor="nw", width=max(150,w-180), font=("Poppins",17,"bold"))
-        badge_y = c.bbox(diff_item)[3] + 8
+        badge_y = diff_y
+        if m:
+            diff_item = c.create_text(22, diff_y, text="‹ " + m["version"].strip(" <>‹›") + " ›",
+                fill="white", anchor="nw", width=max(150,w-180), font=("Poppins",17,"bold"))
+            badge_y = c.bbox(diff_item)[3] + 8
         label_y = badge_y + 46 if m else badge_y + 8
         rate_y = label_y + 28
         rows = max(1, math.ceil(len(rates) / columns)) if rates else 0
         h = rate_y + (rows-1)*48 + 38 + 18 if rates else label_y+38
         c.configure(height=h)
-        from ui_components import chart_backdrop
+        from ui_components import chart_backdrop, draw_chart_pill
+        self._card_pills = []
         image = chart_backdrop(self.background_image,w,h)
         self.card_image = ImageTk.PhotoImage(image)
         background=c.create_image(0,0,image=self.card_image,anchor="nw")
@@ -1693,15 +1689,14 @@ class App(ctk.CTk):
                     card_od = "?"
             for text in (f"{m['keys']}K",f"{m['bpm']} BPM",f"OD {card_od}"):
                 width=max(58,badge_font.measure(text)+20)
-                self._rounded_tile(x,badge_y,x+width,badge_y+36,"#5987ee","#80a4ff")
-                c.create_text(x+width/2,badge_y+18,text=text,fill="white",font=badge_font)
+                draw_chart_pill(c,self._card_pills,x,badge_y,width,36,text,badge_font,"#365eae","#80a4ff")
                 x+=width+8
         c.create_text(22,label_y,text="Rates being created:" if rates else "Choose or enter rates below",
                       fill="white",anchor="nw",font=("Poppins",13))
         for i,rate in enumerate(rates):
             x=22+(i % columns)*76; y=rate_y+(i // columns)*48
-            self._rounded_tile(x,y,x+68,y+38,"#b88925","#efd17a")
-            c.create_text(x+34,y+19,text=fmt_rate(rate),fill="white",font=("Poppins",14,"bold"))
+            draw_chart_pill(c,self._card_pills,x,y,68,38,fmt_rate(rate),
+                            ("Poppins",14,"bold"),"#805b17","#efd17a")
 
     def toggle_rate(self, r):
         cur = self.parse_rates(silent=True)

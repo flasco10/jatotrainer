@@ -1,8 +1,8 @@
 """Embedded compact rate changer; shares the full mode's chart and settings."""
 import tkinter as tk
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageTk
-from ui_components import TextCanvas
+from PIL import ImageTk
+from ui_components import TextCanvas, chart_backdrop
 
 
 class CompactMode(ctk.CTkFrame):
@@ -129,13 +129,8 @@ class CompactMode(ctk.CTkFrame):
         app = self.app; m = app.selected
         w = max(100, self.card.winfo_width())
         self.card.delete('all')
-        if app.background_image is not None:
-            im = ImageEnhance.Brightness(ImageOps.fit(app.background_image, (w, 70))).enhance(.28).convert('RGBA')
-        else:
-            im = Image.new('RGBA', (w, 70), '#111727')
-        mask = Image.new('L', (w, 70), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, w-1, 69), radius=14, fill=255)
-        im.putalpha(mask)
+        im = chart_backdrop(app.background_image,w,70,radius=14,fill='#111727',
+                            tint='#000000',shade=.72,outline='#263653')
         self.photo = ImageTk.PhotoImage(im)
         self.card.create_image(0, 0, image=self.photo, anchor='nw')
         def line(text, y, color, size):

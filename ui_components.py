@@ -1,5 +1,7 @@
 """Small text-baseline adjustment shared by jatotrainer's interfaces."""
+from functools import lru_cache
 import tkinter as tk
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 import customtkinter as ctk
 
 
@@ -34,16 +36,45 @@ class TextCanvas(tk.Canvas):
         return super().create_text(*args,**kwargs)
 
 
-def chart_backdrop(background, width, height):
-    """Draw the rounded, tinted background shared by chart cards."""
-    from PIL import Image, ImageDraw, ImageOps
+@lru_cache(maxsize=96)
+def _rounded_mask(width, height, radius, inset=0):
+    """Rasterize the outline at 4× and reduce it to clean subpixel edges."""
+    scale = 4
+    mask = Image.new("L", (width * scale, height * scale))
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (inset * scale, inset * scale, (width - inset) * scale - 1,
+         (height - inset) * scale - 1),
+        radius=max(0, radius - inset) * scale, fill=255,
+    )
+    return mask.resize((width, height), Image.Resampling.LANCZOS)
 
-    image = Image.new("RGB", (width, height), "#171d30")
+
+def chart_backdrop(background, width, height, *, radius=24, fill="#171d30",
+                   tint="#111322", shade=.58, outline="#7382a0"):
+    """Draw the rounded, tinted background shared by chart cards."""
+    size = (width, height)
+    image = Image.new("RGB", size, fill)
     if background is not None:
-        image = ImageOps.fit(background, (width, height), method=Image.Resampling.LANCZOS)
-        image = Image.blend(image, Image.new("RGB", (width, height), "#111322"), .58)
-    mask = Image.new("L", (width, height))
-    ImageDraw.Draw(mask).rounded_rectangle((1, 1, width-2, height-2), radius=24, fill=255)
-    image.putalpha(mask)
-    ImageDraw.Draw(image).rounded_rectangle((2, 2, width-3, height-3), radius=24, outline="#9c95aa", width=3)
+        image = ImageOps.fit(background, size, method=Image.Resampling.LANCZOS)
+        image = Image.blend(image, Image.new("RGB", size, tint), shade)
+    border = Image.new("RGB", size, outline)
+    border.paste(image, (0, 0), _rounded_mask(width, height, radius, 1))
+    border.putalpha(_rounded_mask(width, height, radius))
+    return border
+
+
+@lru_cache(maxsize=128)
+def _pill_image(width, height, fill, outline):
+    radius = min(width, height) // 2
+    image = Image.new("RGB", (width, height), outline)
+    image.paste(fill, (0, 0, width, height), _rounded_mask(width, height, radius, 1))
+    image.putalpha(_rounded_mask(width, height, radius))
     return image
+
+
+def draw_chart_pill(canvas, images, x, y, width, height, text, font, fill, outline, color="white"):
+    """Draw a true capsule with antialiased edges and native-resolution text."""
+    photo = ImageTk.PhotoImage(_pill_image(width, height, fill, outline), master=canvas)
+    images.append(photo)
+    canvas.create_image(x, y, image=photo, anchor="nw")
+    canvas.create_text(x + width / 2, y + height / 2, text=text, fill=color, font=font)

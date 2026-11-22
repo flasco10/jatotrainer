@@ -9,7 +9,7 @@ import customtkinter as ctk
 from pack_maker import Popover, FolderPicker
 from chart_conversion import catalog, convert, preview_background
 from PIL import Image, ImageTk
-from ui_components import TextCanvas, chart_backdrop
+from ui_components import TextCanvas, chart_backdrop, draw_chart_pill
 
 
 class SourcePicker(Popover):
@@ -208,6 +208,7 @@ class ConversionPage(ctk.CTkFrame):
         c=self.card
         w=max(100,c.winfo_width());h=134
         c.delete('all')
+        self._card_pills=[]
         self._card_photo=ImageTk.PhotoImage(chart_backdrop(self._preview_image,w,h))
         c.create_image(0,0,image=self._card_photo,anchor='nw')
         chart=self._preview_entry
@@ -232,10 +233,8 @@ class ConversionPage(ctk.CTkFrame):
         for value in badges:
             right=x+font.measure(value)+20
             if right>w-18:break
-            c.create_polygon(x+8,87,right-8,87,right,87,right,95,right,105,right,113,
-                             right-8,113,x+8,113,x,113,x,105,x,95,x,87,
-                             smooth=True,fill='#203453',outline='#40628c')
-            c.create_text(x+10,91,text=value,anchor='nw',fill='#9bc5ff',font=font)
+            draw_chart_pill(c,self._card_pills,x,87,right-x,26,value,font,
+                            '#203453','#40628c',color='#9bc5ff')
             x=right+6
         if w-x>85:
             label(w-18,91,f"By {chart['creator']}",10,w-x-18,anchor='ne')
