@@ -8,7 +8,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 from pack_backend import background_path, plain_title, safe_source, validate_settings
 
@@ -28,12 +28,9 @@ def auto_weights(lengths):
     return [max(1, min(4, round(length / median))) for length in lengths]
 
 
-def auto_row_count(total_weight, size=SIZE):
-    """Row count whose tiles come out closest to square (so few maps get tall strips, many get a grid)."""
-    width, height = size
-    total_weight = max(total_weight, 1)
-    return min(range(1, math.ceil(total_weight) + 1),
-               key=lambda rows: abs(math.log((width * rows / total_weight) / (height / rows))))
+def auto_row_count(total_weight, per_row=4):
+    """Fill rows of side-by-side strips, starting a new row past `per_row` slots (None = one row)."""
+    return 1 if per_row is None else max(1, math.ceil(round(total_weight, 6) / per_row))
 
 
 def _balanced_rows(weights, rows):
@@ -51,7 +48,7 @@ def _balanced_rows(weights, rows):
         for j in range(r, n + 1):
             for i in range(r - 1, j):
                 cost = best[r - 1][i] + (prefix[j] - prefix[i] - target) ** 2
-                if cost < best[r][j]:
+                if cost <= best[r][j]:  # on ties, later cuts put more maps on the upper rows
                     best[r][j], cut[r][j] = cost, i
     groups, j = [], n
     for r in range(rows, 0, -1):
@@ -61,7 +58,7 @@ def _balanced_rows(weights, rows):
     return groups[::-1]
 
 
-def collage_layout(weights, rows=None, size=SIZE, gap=4):
+def collage_layout(weights, rows=None, size=SIZE, gap=4, per_row=4):
     """Return one (x, y, w, h) tile per map.
 
     `rows` is a list with a 1-based row number per map, or None for "Auto".
@@ -74,7 +71,7 @@ def collage_layout(weights, rows=None, size=SIZE, gap=4):
     weights = [max(0.1, float(w)) for w in weights]
     rows = list(rows or [None] * n)
     if all(r is None for r in rows):
-        groups = _balanced_rows(weights, auto_row_count(sum(weights), size))
+        groups = _balanced_rows(weights, auto_row_count(sum(weights), per_row))
     else:
         current, numbered = 1, {}
         for i, row in enumerate(rows):
@@ -99,12 +96,39 @@ def collage_layout(weights, rows=None, size=SIZE, gap=4):
     return rects
 
 
-def render_collage(images, rects, size=SIZE):
-    """Center-crop each image into its tile on a black canvas; missing images become gray tiles."""
+def crop_box(image_size, tile_size, fx=0.5, fy=0.5, zoom=1.0):
+    """Region of the image that fills the tile: covers it at `zoom`, panned by fx/fy (0 = left/top, 1 = right/bottom)."""
+    (iw, ih), (w, h) = image_size, tile_size
+    if iw / ih > w / h:
+        cw, ch = ih * w / h, ih
+    else:
+        cw, ch = iw, iw * h / w
+    cw, ch = cw / max(1.0, zoom), ch / max(1.0, zoom)
+    fx, fy = min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy))
+    left, top = (iw - cw) * fx, (ih - ch) * fy
+    return left, top, left + cw, top + ch
+
+
+def _crop_settings(value):
+    """Accept a bare horizontal focus number or an (fx, fy, zoom) tuple."""
+    if isinstance(value, (int, float)):
+        return float(value), 0.5, 1.0
+    fx, fy, zoom = (tuple(value) + (0.5, 0.5, 1.0)[len(value):])[:3]
+    return float(fx), float(fy), float(zoom)
+
+
+def render_collage(images, rects, size=SIZE, focus=None, resample=Image.Resampling.LANCZOS):
+    """Crop each image into its tile on a black canvas; missing images become gray tiles.
+
+    focus: per image, a horizontal focus (0 = left, 0.5 = center, 1 = right) or (fx, fy, zoom).
+    """
     canvas = Image.new("RGB", size, "#000000")
-    for image, (x, y, w, h) in zip(images, rects):
-        tile = ImageOps.fit(image, (w, h), method=Image.Resampling.LANCZOS) if image is not None \
-            else Image.new("RGB", (w, h), "#2a2f3d")
+    focus = focus or [0.5] * len(rects)
+    for image, (x, y, w, h), setting in zip(images, rects, focus):
+        if image is None:
+            tile = Image.new("RGB", (w, h), "#2a2f3d")
+        else:
+            tile = image.resize((w, h), resample, box=crop_box(image.size, (w, h), *_crop_settings(setting)))
         canvas.paste(tile, (x, y))
     return canvas
 
@@ -226,10 +250,11 @@ def _join_wavs(parts, destination):
 # Marathon
 # --------------------------------------------------------------------------- #
 def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=192, version="Marathon",
-                   weights=None, rows=None, gap=4, report=lambda *args: None):
+                   weights=None, rows=None, gap=4, per_row=4, focus=None, report=lambda *args: None):
     """Create Songs/<Various Artists - name>/ with one .osu, audio.mp3 and a collage background.
 
-    entries: dicts with path, rate, pitch and break_after (seconds of silence after that song).
+    entries: dicts with path, rate, pitch, break_after (seconds of silence after that song)
+    and optionally background (an image path that replaces the map's own background).
     """
     name, creator, od, hp, folder_name = validate_settings(core, name, creator, od, hp)
     version = version.strip() or "Marathon"
@@ -267,7 +292,8 @@ def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=
             raise ValueError(f"{title}: break must be between 0 and 600 seconds.")
         audio = safe_source(path.parent, core.kv(general, "AudioFilename") or "")
         try:
-            bg = background_path(core, {"path": str(path)})
+            # A picture the user chose for this tile replaces the map's own background.
+            bg = entry.get("background") or background_path(core, {"path": str(path)})
         except ValueError:
             bg = None
         charts.append(dict(path=path, sections=sections, title=title, artist=core.kv(meta, "Artist") or "",
@@ -318,7 +344,8 @@ def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=
                 images.append(None)
         if weights is None:
             weights = auto_weights([s[1] - s[0] for s in spans])
-        save_background(render_collage(images, collage_layout(weights, rows, SIZE, gap)), stage / "background.jpg")
+        rects = collage_layout(weights, rows, SIZE, gap, per_row)
+        save_background(render_collage(images, rects, SIZE, focus), stage / "background.jpg")
 
         first = charts[0]["sections"]
         preview = core.kv(core.sec(first, "General"), "PreviewTime")

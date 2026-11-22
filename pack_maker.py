@@ -136,6 +136,7 @@ class PackMaker(ctk.CTkFrame):
             ctk.CTkLabel(header,text=label).pack(side='left',padx=8)
             ctk.CTkEntry(header,textvariable=var,width=180).pack(side='left')
         settings=ctk.CTkFrame(self,fg_color='transparent');settings.grid(row=1,column=0,columnspan=2,sticky='ew',padx=16)
+        self.settings_row=settings
         self.od=tk.StringVar(value=format(od,'g'));self.hp=tk.StringVar(value=format(hp,'g'))
         self.various=tk.BooleanVar(value=False);self.include_artist=tk.BooleanVar(value=False);self.quality=tk.StringVar(value='Original');self.backgrounds_8bit=tk.BooleanVar(value=False)
         for label,var in [(self.SETTINGS_PREFIX+' OD',self.od),(self.SETTINGS_PREFIX+' HP',self.hp)]:
@@ -167,6 +168,9 @@ class PackMaker(ctk.CTkFrame):
         sb=ctk.CTkScrollbar(tf,command=self.tree.yview);self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side='left',fill='both',expand=True);sb.pack(side='right',fill='y')
         self.tree.bind('<<TreeviewSelect>>',self.choose)
+        # Double-click or Enter adds the highlighted chart at the rate in the box.
+        self.tree.bind('<Double-1>',lambda _:(self.choose(),self.add()))
+        self.tree.bind('<Return>',lambda _:(self.choose(),self.add()))
         self.card=ChartCard(self.left,self,None,preview=True)
         self.card.grid(row=4,column=0,sticky='ew',padx=16,pady=6)
         addrow=ctk.CTkFrame(self.left,fg_color='transparent');addrow.grid(row=5,column=0,sticky='ew',padx=12,pady=(0,12))
@@ -223,7 +227,21 @@ class PackMaker(ctk.CTkFrame):
         words=self.search.get().lower().split()
         self.visible=[m for m in self.maps if not m.get('gen') and all(w in ' '.join(str(m.get(k,'')) for k in ('artist','title','version','creator')).lower() for w in words)][:self.core.LIST_LIMIT]
         self.tree.delete(*self.tree.get_children())
-        for i,m in enumerate(self.visible):self.tree.insert('','end',iid=str(i),values=(m['title'],m['version'],m['creator']))
+        added=self.added_paths()
+        for i,m in enumerate(self.visible):self.tree.insert('','end',iid=str(i),values=(self.list_title(m,added),m['version'],m['creator']))
+
+    def added_paths(self):
+        return {e['info']['path'] for e in self.entries}
+
+    @staticmethod
+    def list_title(m,added):
+        return ('✓ ' if m['path'] in added else '')+m['title']
+
+    def mark_added(self):
+        """Tick charts already in the list without rebuilding it (keeps the selection)."""
+        added=self.added_paths()
+        for i,m in enumerate(getattr(self,'visible',[])):
+            if self.tree.exists(str(i)):self.tree.set(str(i),'title',self.list_title(m,added))
 
     def choose(self,_=None):
         selection=self.tree.selection()
@@ -275,6 +293,7 @@ class PackMaker(ctk.CTkFrame):
         if not self.busy:self.entries.remove(entry);self.render_entries()
 
     def render_entries(self):
+        self.mark_added()
         for child in self.cards.winfo_children():child.destroy()
         for i,entry in enumerate(self.entries):
             card=ChartCard(self.cards,self,entry)

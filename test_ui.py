@@ -15,6 +15,10 @@ class InterfaceTests(unittest.TestCase):
         self.config_patch.start()
         with patch.object(j,'find_songs_folder',return_value=None), patch.object(j,'find_ffmpeg',return_value=None), patch.object(j.App,'show_ffmpeg_setup'):
             self.app=j.App()
+            # Fully transparent but still mapped: real layout for the checks, nothing flashes on screen.
+            # Set JATO_SHOW_TEST_WINDOWS=1 to watch the tests run.
+            if not os.environ.get('JATO_SHOW_TEST_WINDOWS'):
+                self.app.attributes('-alpha', 0.0)
             self.app.update()
     def tearDown(self):
         # Stop Tk timers before destroying widgets.
@@ -298,7 +302,61 @@ class InterfaceTests(unittest.TestCase):
         m.move(m.entries[2],-1);self.assertEqual([e['info']['title'] for e in m.entries],['One','Long','Two','One'])
         m.draw_preview();a.update()
         self.assertIn('4 songs',m.total_label.cget('text'))
+        self.assertEqual(m.per_row_value(),4);m.per_row.set('All in one row');self.assertIsNone(m.per_row_value())
+        m.per_row.set('4');m.draw_preview();a.update()
+        from types import SimpleNamespace as E
+        ed=m.preview_canvas;centre=lambda i:(ed.rects[i][0]+ed.rects[i][2]//2,ed.rects[i][1]+ed.rects[i][3]//2)
+        # Dragging a tile right pans its picture right (focus moves toward the left edge).
+        x,y=centre(0);ed.press(E(x=x,y=y));self.assertEqual(m.selected_tile,0)
+        ed.motion(E(x=x+30,y=y));ed.release(E(x=x+30,y=y))
+        self.assertLess(m.focus_values()[0][0],0.5)
+        ed.wheel(E(x=x,y=y,delta=120));self.assertGreater(m.focus_values()[0][2],1.0)
+        ed.double(E(x=x,y=y));self.assertEqual(m.focus_values()[0],(0.5,0.5,1.0))
+        # The top bar is the move zone; the rest of the tile is the pan zone.
+        bx,by=ed.rects[0][0]+10,ed.rects[0][1]+10;tx,ty=centre(2)
+        self.assertEqual(ed.zone_at(bx,by),(0,'handle'));self.assertEqual(ed.zone_at(tx,ty),(2,'pan'))
+        ed.hover_move(E(x=bx,y=by));self.assertEqual(ed.cget('cursor'),'hand2')
+        # Dragging tile 1's bar onto tile 3 moves that song to position 3 (play order too).
+        cards={id(e):e['card'] for e in m.entries}
+        ed.press(E(x=bx,y=by));ed.motion(E(x=tx,y=ty))
+        self.assertEqual(ed.target,2);self.assertIsNotNone(ed.preview_rects)  # new order shown before the drop
+        ed.release(E(x=tx,y=ty))
+        self.assertEqual([e['info']['title'] for e in m.entries],['Long','Two','One','One'])
+        self.assertEqual(m.selected_tile,2)
+        # Reordering reuses the song cards (rebuilding them froze the UI for ~1 s) and renumbers them.
+        self.assertTrue(all(e['card'] is cards[id(e)] for e in m.entries))
+        self.assertEqual([e['card'].number.cget('text') for e in m.entries],['1','2','3','4'])
+        # Panning never reorders, even when the mouse ends up over another tile.
+        m.draw_preview();a.update()  # the move's scheduled redraw
+        x,y=centre(1);tx,ty=centre(3)
+        ed.press(E(x=x,y=y));ed.motion(E(x=tx,y=ty));ed.release(E(x=tx,y=ty))
+        self.assertEqual([e['info']['title'] for e in m.entries],['Long','Two','One','One'])
+        self.assertNotEqual(m.focus_values()[1][0],0.5)
+        hx,hy=centre(1);ed.hover_move(E(x=hx,y=hy));self.assertEqual((ed.hover,ed.hover_zone),(1,'pan'))
+        self.assertEqual(ed.cget('cursor'),'sb_h_double_arrow')  # this tile only has room to pan sideways
+        ed.hover_move(E(x=centre(2)[0],y=centre(2)[1]));self.assertEqual(ed.cget('cursor'),'arrow')  # exact fit: nothing to pan
+        m.set_image(0,str(folder/'One.png'));self.assertEqual(m.entries[0]['image'],str(folder/'One.png'))
+        self.assertEqual(m.entries[0]['thumb'].getpixel((0,0)),(255,0,0))
+        m.set_image(0,None);self.assertIsNone(m.entries[0]['image'])
+        big=m.open_editor();a.update();self.assertEqual(len(big.rects),4)
+        a._active_popover.destroy();a.update()
+        m.select_tile(3);ed.event_generate('<Delete>');self.assertEqual(len(m.entries),3)  # Delete removes the selected song
+        # The song list ticks charts already added; double-click adds the highlighted one.
+        m.maps=[dict(c,gen=False) for c in charts];m.search.set('');a.update()
+        self.assertTrue(m.tree.set('0','title').startswith('✓ '))
+        m.tree.selection_set('2');m.tree.focus_set();m.tree.event_generate('<Return>');self.assertEqual(len(m.entries),4)  # same handler as double-click
+        # Name and bitrate are on the page; bitrates above 192 warn inline.
+        self.assertTrue(m.compression_button.winfo_manager()=='' )
+        m.bitrate.set('320 kbps');self.assertIn('192',m.bitrate_warning.cget('text'))
+        m.bitrate.set('192 kbps');self.assertEqual(m.bitrate_warning.cget('text'),'')
         m.remove(m.entries[3]);self.assertEqual(len(m.entries),3)
+        # One break value for every gap; songs added later start with it.
+        m.default_break.set('5');m.apply_break_to_all()
+        self.assertEqual({e['brk'].get() for e in m.entries},{'5'})
+        m.default_break.set('-1');m.apply_break_to_all();self.assertIn('0–600',m.status.cget('text'))
+        self.assertEqual({e['brk'].get() for e in m.entries},{'5'})
+        m.default_break.set('2.5');m.apply_break_to_all();m.selected=charts[1];m.add()
+        self.assertEqual(m.entries[-1]['brk'].get(),'2.5');m.remove(m.entries[-1])
         m.entries[0]['brk'].set('abc');m.build();self.assertIn('must be numbers',m.status.cget('text'))
         a.back_from_pack();a.update()
         self.assertFalse(m.winfo_ismapped());self.assertTrue(a.sidebar_btn.winfo_ismapped())

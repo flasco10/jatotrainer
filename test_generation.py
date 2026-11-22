@@ -261,6 +261,21 @@ class GenerationTests(unittest.TestCase):
         for rate in [0, 1, 6, float('nan'), float('inf')]:
             with self.assertRaises(ValueError): self.generate((rate,))
         self.assertFalse(self.maps())
+    def test_header_reader_stops_early_but_handles_unusual_order(self):
+        path = self.root / 'odd.osu'
+        def chart(*lines):
+            path.write_text('\n'.join(('osu file format v14',) + lines) + '\n')
+            return m.read_header_info(str(path))
+        # Metadata after TimingPoints: the reader must not stop at the first red line.
+        info = chart('[General]', 'Mode: 3', '[TimingPoints]', '0,250,4,1,0,100,1,0',
+                     '[Metadata]', 'Title:Late', 'Version:X', '[Difficulty]', 'CircleSize:7', '[HitObjects]')
+        self.assertEqual((info['title'], info['keys'], info['bpm']), ('Late', 7, 240))
+        self.assertIsNone(chart('[General]', 'Mode: 0', '[Metadata]', 'Title:Std'))
+        # Inherited lines before the first red line are skipped for BPM, as before.
+        info = chart('[General]', 'Mode: 3', '[Metadata]', 'Title:T', '[Difficulty]', 'CircleSize:4', '[TimingPoints]',
+                     '0,-100,4,1,0,100,0,0', '10,500,4,1,0,100,1,0', '20,300,4,1,0,100,1,0')
+        self.assertEqual(info['bpm'], 120)
+
     def test_cache_same_mtime_modified_metadata(self):
         songs=self.root/'Songs'; folder=songs/'set'; folder.mkdir(parents=True)
         path=folder/'map.osu'; path.write_text(MAP)

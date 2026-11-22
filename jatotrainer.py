@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 
 from ffmpeg_setup import DOWNLOAD_URL, EXE_NAME, install_ffmpeg, managed_ffmpeg_path
+import osu_db
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
@@ -39,6 +40,8 @@ BG_PANEL = "#0f1320"
 BG_MAIN = "#080a12"
 
 LIST_LIMIT = 3000  # max rows shown in the list (search/auto-select narrows it)
+# Shown in the header; keep in step with the installer default in installer.iss.
+APP_VERSION = "1.6.0"
 DEFAULT_FORMAT = "{diff} ({rate}x)"
 # osu! ranking criteria cap MP3 at 192 kbps; higher bitrates bloat uploads past Bancho's size limit.
 DEFAULT_BITRATE = 192
@@ -405,26 +408,38 @@ def main_bpm(timing):
     return 0.0
 
 
+_HEADER_SECTIONS = ("General", "Metadata", "Difficulty")
+
+
 def read_header_info(path):
-    """Fast scan: returns dict for mania maps, None otherwise."""
-    section, general, meta, diff, timing = None, [], [], [], []
+    """Fast scan: returns dict for mania maps, None otherwise.
+
+    Stops as soon as the header sections and the first uninherited timing point are
+    known, so long storyboards, SV sections and hit objects are never read.
+    """
+    section, seen = None, set()
+    lines = {"General": [], "Metadata": [], "Difficulty": [], "TimingPoints": []}
     with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
             line = line.rstrip("\r\n")
-            m = re.match(r"^\[(.+)\]\s*$", line)
-            if m:
-                section = m.group(1)
-                if section == "HitObjects":
-                    break
+            if line[:1] == "[":
+                m = re.match(r"^\[(.+)\]\s*$", line)
+                if m:
+                    if section == "General" and kv(lines["General"], "Mode") != "3":
+                        return None  # not osu!mania; skip the rest of the file
+                    section = m.group(1)
+                    seen.add(section)
+                    if section == "HitObjects":
+                        break
+                    continue
+            target = lines.get(section)
+            if target is None:
                 continue
-            if section == "General":
-                general.append(line)
-            elif section == "Metadata":
-                meta.append(line)
-            elif section == "Difficulty":
-                diff.append(line)
-            elif section == "TimingPoints":
-                timing.append(line)
+            target.append(line)
+            # main_bpm only needs the first uninherited point; the header is already complete.
+            if section == "TimingPoints" and seen.issuperset(_HEADER_SECTIONS) and main_bpm([line]):
+                break
+    general, meta, diff, timing = lines["General"], lines["Metadata"], lines["Difficulty"], lines["TimingPoints"]
     if kv(general, "Mode") != "3":
         return None
     tags = kv(meta, "Tags") or ""
@@ -442,47 +457,92 @@ def read_header_info(path):
     )
 
 
+def _read_header_safe(path):
+    try:
+        return read_header_info(path), False
+    except Exception:
+        return None, True
+
+
+def _osu_db_entries(songs_dir):
+    """osu!.db entries keyed by normalized chart path; empty if osu!.db is missing or unreadable."""
+    candidates = [os.path.join(os.path.dirname(os.path.abspath(songs_dir)), "osu!.db")]
+    for find in (_running_osu_dir, _registry_osu_dir):  # a custom Songs folder lives outside osu!
+        try:
+            root = find()
+        except Exception:
+            root = None
+        if root:
+            candidates.append(os.path.join(root, "osu!.db"))
+    for db in candidates:
+        if os.path.isfile(db):
+            try:
+                _, entries = osu_db.read_osu_db(db)
+            except Exception:
+                continue  # unknown or damaged format: fall back to reading the charts
+            return {os.path.normcase(os.path.join(songs_dir, m["folder"], m["file"])): m for m in entries}
+    return {}
+
+
 def scan_songs(songs_dir, progress=None):
     """Returns (maps, stats). Looks in Songs/<set>/*.osu, exactly like osu! does."""
     cache = load_json(CACHE_PATH, {})
     if not isinstance(cache, dict):
         cache = {}
-    new_cache, maps = {}, []
+    new_cache, found, misses = {}, [], []
     stats = dict(files=0, mania=0, errors=0, folders=0)
     folders = [e.path for e in os.scandir(songs_dir) if e.is_dir()]
     stats["folders"] = len(folders)
     total = len(folders)
 
-    def osu_files(folder):  # osu! stable only reads Songs/<set>/*.osu, not nested folders
-        for e in os.scandir(folder):
-            if e.is_file() and e.name.lower().endswith(".osu"):
-                yield e
-
     for i, folder in enumerate(folders):
         try:
-            for e in osu_files(folder):
+            # osu! stable only reads Songs/<set>/*.osu, not nested folders
+            for e in os.scandir(folder):
+                if not (e.is_file() and e.name.lower().endswith(".osu")):
+                    continue
                 stats["files"] += 1
                 st = e.stat()
                 signature = [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
                 c = cache.get(e.path)
                 if isinstance(c, dict) and c.get("signature") == signature and "info" in c and (c["info"] is None or "gen" in c["info"]):
-                    info = c["info"]
+                    new_cache[e.path] = c
                 else:
-                    try:
-                        info = read_header_info(e.path)
-                    except Exception:
-                        info = None
-                        stats["errors"] += 1
-                new_cache[e.path] = {"signature": signature, "info": info}
-                if info:
-                    maps.append(info)
-                    if not info.get("gen"):
-                        stats["mania"] += 1
+                    new_cache[e.path] = {"signature": signature, "info": None}
+                    misses.append(e.path)
+                found.append(e.path)
         except OSError:
             stats["errors"] += 1
         if progress and i % 50 == 0:
             progress(i, total)
-    save_json(CACHE_PATH, new_cache)
+
+    # osu! already indexes every chart in osu!.db: one file read instead of thousands of opens.
+    # Use an entry only while the chart's write time still matches what osu! recorded.
+    if misses:
+        indexed = _osu_db_entries(songs_dir)
+        unread = []
+        for path in misses:
+            entry = indexed.get(os.path.normcase(path))
+            if entry and osu_db.same_file_time(new_cache[path]["signature"][0], entry["modified"]):
+                new_cache[path]["info"] = osu_db.scan_info(entry, path, GEN_TAG)
+            else:
+                unread.append(path)
+        stats["from_osu_db"] = len(misses) - len(unread)
+        # Only new or edited charts are parsed; a few threads hide file-open latency without pinning the CPU.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for path, (info, failed) in zip(unread, pool.map(_read_header_safe, unread)):
+                new_cache[path]["info"] = info
+                stats["errors"] += failed
+    maps = []
+    for path in found:
+        info = new_cache[path]["info"]
+        if info:
+            maps.append(info)
+            if not info.get("gen"):
+                stats["mania"] += 1
+    # Rewriting the multi-MB cache is most of a repeat scan, so only save real changes.
+    if misses or len(new_cache) != len(cache):
+        save_json(CACHE_PATH, new_cache)
     return maps, stats
 
 
@@ -1082,7 +1142,7 @@ class App(ctk.CTk):
         self.brand_logo = ctk.CTkImage(light_image=logo, dark_image=logo, size=(40, 46))
         ctk.CTkLabel(brand, text="", image=self.brand_logo, width=40, height=46).pack(side="left", padx=(0, 10))
         ctk.CTkLabel(brand, text="jatotrainer", font=ctk.CTkFont(family="Poppins", size=19, weight="bold")).pack(side="left")
-        ctk.CTkLabel(brand, text="v1.5.0", width=56, height=24, fg_color="#15243e",
+        ctk.CTkLabel(brand, text=f"v{APP_VERSION}", width=56, height=24, fg_color="#15243e",
                      corner_radius=12, text_color="#8eb6ff", font=ctk.CTkFont(family="Poppins", size=11)).pack(side="left", padx=10)
         self.pack_btn = ctk.CTkButton(header, text="Pack maker", width=105, height=36,
                                       fg_color="#131a2a", hover_color="#202b40", corner_radius=18,
@@ -1301,7 +1361,7 @@ class App(ctk.CTk):
         self.bitrate_var.trace_add("write", lambda *_: self._update_bitrate_warning())
         self._update_bitrate_warning()
 
-        self.gen_btn = ctk.CTkButton(self.conversion_dock, text="Convert charts", height=44, corner_radius=22, border_width=1, border_color="#78a8ff", fg_color=ACCENT,
+        self.gen_btn = ctk.CTkButton(self.conversion_dock, text="Create rates", height=44, corner_radius=22, border_width=1, border_color="#78a8ff", fg_color=ACCENT,
                                      hover_color=ACCENT_HOVER, font=ctk.CTkFont(family="Poppins", size=15, weight="bold"),
                                      command=self.on_generate, state="disabled")
         self.gen_btn.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 6))
@@ -1482,7 +1542,7 @@ class App(ctk.CTk):
             self._progress_job = None
         color = "#34d399" if finished else "#fb7185" if failed else ACCENT
         self.progress.configure(progress_color=color)
-        label = "Complete · 100%" if finished else "Conversion failed" if failed else f"Converting · {value:.0%}"
+        label = "Complete · 100%" if finished else "Creating rates failed" if failed else f"Creating rates · {value:.0%}"
         self.progress_label.configure(text=label, text_color=color)
         start = self.progress.get()
         if failed or value == 0:
@@ -1805,7 +1865,7 @@ class App(ctk.CTk):
         self.cfg.update(od_override_enabled=self.od_override_enabled.get(), od_override=self.od_override_value.get(), format=self.fmt_var.get(), pitch=self.pitch_var.get(), od=self.od_var.get(), bitrate=self._bitrate(), rates=self.rates_var.get())
         save_json(CONFIG_PATH, self.cfg)
         self.busy = True
-        self.gen_btn.configure(state="disabled", text="Converting…")
+        self.gen_btn.configure(state="disabled", text="Creating rates…")
         self._set_progress(0)
         self.log.configure(state="normal"); self.log.delete("1.0", "end"); self.log.configure(state="disabled")
         if getattr(self, "compact_active", False):
@@ -1842,7 +1902,7 @@ class App(ctk.CTk):
                 elif k == "done":
                     self._set_progress(1, finished=True)
                     self.busy = False
-                    self.gen_btn.configure(text="Convert charts")
+                    self.gen_btn.configure(text="Create rates")
                     outputs = msg[2] if len(msg) > 2 else []
                     self.last_outputs = outputs
                     created = sum(output['created'] for output in outputs)
@@ -1863,7 +1923,7 @@ class App(ctk.CTk):
                     self.logs_expanded = True
                     self._apply_logs()
                     self.busy = False
-                    self.gen_btn.configure(text="Convert charts")
+                    self.gen_btn.configure(text="Create rates")
                     self._log("ERROR: " + msg[1])
                     self.status.configure(text="Conversion failed: " + msg[1])
                     self.on_options_changed()

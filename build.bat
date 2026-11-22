@@ -21,7 +21,7 @@ build-tools\reader\Jatotrainer.OsuReader.exe --self-test
 if errorlevel 1 goto :err
 python -m pip install -r requirements.txt
 if errorlevel 1 goto :err
-python -m PyInstaller --noconfirm --clean --onedir --windowed --name jatotrainer --icon assets\jatotrainer.ico --add-data "assets;assets" --collect-all customtkinter --collect-all simfile --collect-all fs --collect-all msdparser --collect-all pkg_resources --add-data "LICENSE;." --add-data "THIRD_PARTY.md;." jatotrainer.py
+python -m PyInstaller --noconfirm --clean --onedir --windowed --name jatotrainer --icon assets\jatotrainer.ico --add-data "assets;assets" --collect-all customtkinter --collect-all simfile --collect-all fs --collect-all msdparser --collect-all pkg_resources --exclude-module PIL._avif --add-data "LICENSE;." --add-data "THIRD_PARTY.md;." jatotrainer.py
 if errorlevel 1 goto :err
 copy /y build-tools\audio\ffmpeg.exe dist\jatotrainer\ffmpeg.exe >nul
 if errorlevel 1 goto :err

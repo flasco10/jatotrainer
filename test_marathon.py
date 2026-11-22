@@ -33,13 +33,33 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual([r[1] for r in rects], [0, 0, 0, 0, 540, 540, 540])
         self.assertEqual([r[2] for r in rects], [480, 480, 480, 480, 480, 960, 480])
 
-    def test_many_maps_stack_into_more_rows(self):
-        self.assertEqual(mb.auto_row_count(1), 1)
-        self.assertEqual(mb.auto_row_count(2), 1)
-        self.assertEqual(mb.auto_row_count(4), 2)
-        self.assertEqual(mb.auto_row_count(12), 3)
+    def test_up_to_four_maps_sit_side_by_side(self):
+        rects = mb.collage_layout([1] * 4, gap=0)
+        self.assertEqual(rects, [(0, 0, 480, 1080), (480, 0, 480, 1080), (960, 0, 480, 1080), (1440, 0, 480, 1080)])
+
+    def test_rows_fill_up_to_max_per_row(self):
+        self.assertEqual([mb.auto_row_count(n) for n in (1, 2, 4, 5, 8, 9, 12)], [1, 1, 1, 2, 2, 3, 3])
+        self.assertEqual(mb.auto_row_count(5, per_row=5), 1)
+        # Five maps: the extra map goes to the upper row (3 + 2).
+        rects = mb.collage_layout([1] * 5, gap=0)
+        self.assertEqual([r[1] for r in rects], [0, 0, 0, 540, 540])
         rects = mb.collage_layout([1] * 12, gap=0)
         self.assertEqual(len({r[1] for r in rects}), 3)
+
+    def test_all_in_one_row(self):
+        self.assertEqual(mb.auto_row_count(12, per_row=None), 1)
+        rects = mb.collage_layout([1, 1, 2, 1, 1, 1, 1], gap=0, per_row=None)
+        self.assertEqual({r[1] for r in rects}, {0})
+        self.assertEqual(rects[2][2], 2 * rects[0][2])  # the long song is still twice as wide
+
+    def test_focus_pans_the_crop(self):
+        image = Image.new("RGB", (1600, 900), "blue")
+        image.paste(Image.new("RGB", (400, 900), "red"), (0, 0))
+        rect = [(0, 0, 200, 1080)]
+        left = mb.render_collage([image], rect, (200, 1080), focus=[0.0])
+        center = mb.render_collage([image], rect, (200, 1080), focus=[0.5])
+        self.assertGreater(left.getpixel((100, 500))[0], 200)
+        self.assertGreater(center.getpixel((100, 500))[2], 200)
 
     def test_manual_rows_and_tiles_cover_canvas(self):
         rects = mb.collage_layout([1, 2, 1], rows=[1, 2, None], gap=4)
