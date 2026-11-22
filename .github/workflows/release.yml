@@ -59,7 +59,7 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           $env:PATH = "$PWD\build-tools\audio;$env:PATH"
-          python -m unittest test_conversion test_generation test_osu_reader test_pack
+          python -m unittest test_conversion test_generation test_marathon test_osu_reader test_pack
 
       - name: Smoke-test the exe starts
         shell: pwsh

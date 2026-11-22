@@ -53,8 +53,7 @@ FORMAT_PRESETS = [
     "{diff} - {rate}x ({bpm}bpm)",
     "{diff} {pct}%",
 ]
-# 0.8-1.5 in 0.05 steps where most practice happens, then 0.1 steps up to 2.0 (1.0 = original).
-QUICK_RATES = [f"{x / 100:g}" for x in [*range(80, 151, 5), *range(160, 201, 10)] if x != 100]
+QUICK_RATES = [f"{x / 100:g}" for x in range(80, 201, 5) if x != 100]  # 0.8 ... 2.0 in 0.05 steps (1.0 = original)
 
 
 # --------------------------------------------------------------------------- #
@@ -668,23 +667,27 @@ def validate_rate(rate):
         raise ValueError("Rate must be finite, between 0.1 and 5, and different from 1.")
 
 
+def rate_filter(rate, pitch):
+    """FFmpeg audio filter that plays at `rate` (pitch shifts with speed when `pitch`)."""
+    if pitch:
+        # Normalize the input before changing its declared sample rate. This
+        # gives the requested speed/pitch for both 44.1 and 48 kHz sources.
+        return f"aresample=44100,asetrate=44100*{repr(rate)},aresample=44100"
+    stages, r = [], rate
+    while r > 2.0:
+        stages.append("atempo=2.0"); r /= 2.0
+    while r < 0.5:
+        stages.append("atempo=0.5"); r /= 0.5
+    stages.append(f"atempo={repr(r)}")
+    return ",".join(stages)
+
+
 def make_audio(ffmpeg, src, dst, rate, pitch, bitrate=320, allow_original=False):
     if rate != 1 or not allow_original:
         validate_rate(rate)
     if not isinstance(bitrate, int) or not 32 <= bitrate <= 320:
         raise ValueError("MP3 bitrate must be between 32 and 320 kbps")
-    if pitch:
-        # Normalize the input before changing its declared sample rate. This
-        # gives the requested speed/pitch for both 44.1 and 48 kHz sources.
-        flt = f"aresample=44100,asetrate=44100*{repr(rate)},aresample=44100"
-    else:
-        stages, r = [], rate
-        while r > 2.0:
-            stages.append("atempo=2.0"); r /= 2.0
-        while r < 0.5:
-            stages.append("atempo=0.5"); r /= 0.5
-        stages.append(f"atempo={repr(r)}")
-        flt = ",".join(stages)
+    flt = rate_filter(rate, pitch)
     cmd = [ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-i", src,
            "-map", "0:a:0", "-vn", "-filter:a", flt,
            "-codec:a", "libmp3lame", "-b:a", f"{bitrate}k", "-ar", "44100",
@@ -1109,6 +1112,10 @@ class App(ctk.CTk):
                                             corner_radius=15, fg_color="#131a2a", hover_color="#202b40",
                                             command=self.open_conversion)
         self.conversion_btn.grid(row=2, column=0, columnspan=6, sticky="e", padx=16, pady=(0,10))
+        self.marathon_btn = ctk.CTkButton(header, text="Marathon maker", width=150, height=30,
+                                          corner_radius=15, fg_color="#131a2a", hover_color="#202b40",
+                                          command=self.open_marathon_maker)
+        self.marathon_btn.grid(row=2, column=0, columnspan=6, sticky="e", padx=(0, 16 + 205 + 8), pady=(0, 10))
 
         self.ffmpeg_setup_btn = ctk.CTkButton(header, text="Set up FFmpeg", width=145, height=30,
                                               corner_radius=15, command=self.show_ffmpeg_setup)
@@ -1219,7 +1226,7 @@ class App(ctk.CTk):
         for i, r in enumerate(QUICK_RATES):
             b = ctk.CTkButton(chips, text=f"{r}x", width=56, height=28, fg_color="#171c2c",
                               hover_color="#242d45", command=lambda r=r: self.toggle_rate(r))
-            b.grid(row=i // 7, column=i % 7, padx=3, pady=3)
+            b.grid(row=i // 8, column=i % 8, padx=3, pady=3)
             self.chip_btns[r] = b
         self.rates_var = tk.StringVar(value=self.cfg.get("rates", "1.1, 1.2, 1.3"))
         self.rates_var.trace_add("write", lambda *_: self.on_options_changed())
@@ -1404,6 +1411,17 @@ class App(ctk.CTk):
         from pack_maker import PackSetup
         self.pack_window = PackSetup(self)
 
+    def open_marathon_maker(self):
+        from marathon_maker import MarathonMaker, MarathonSetup
+        existing = getattr(self, "marathon_window", None)
+        if existing is not None and existing.winfo_exists():
+            if isinstance(existing, MarathonMaker):
+                self.show_pack_page(existing)
+            else:
+                existing.lift()
+            return
+        self.marathon_window = MarathonSetup(self)
+
     def show_pack_page(self, page):
         if not hasattr(self, "_main_widgets"):
             self._main_widgets = [w for w in self.winfo_children() if w is not page and w.winfo_manager() == "grid"]
@@ -1418,10 +1436,11 @@ class App(ctk.CTk):
         popover = getattr(self, "_active_popover", None)
         if popover is not None and popover.winfo_exists():
             popover.destroy()
-        page = getattr(self, "pack_window", None)
-        if page is not None and page.winfo_exists():
-            page.active = False
-            page.grid_remove()
+        for name in ("pack_window", "marathon_window"):
+            page = getattr(self, name, None)
+            if page is not None and page.winfo_exists() and hasattr(page, "active"):
+                page.active = False
+                page.grid_remove()
         self.grid_columnconfigure(1, weight=1, minsize=440)
         for widget in getattr(self, "_main_widgets", []):
             widget.grid()

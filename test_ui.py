@@ -32,7 +32,8 @@ class InterfaceTests(unittest.TestCase):
             time.sleep(.01)
     def test_rate_presets_slider_and_ignored_input(self):
         a=self.app
-        self.assertEqual(j.QUICK_RATES[0],'0.8');self.assertEqual(j.QUICK_RATES[-1],'2')
+        self.assertEqual(j.QUICK_RATES[0],'0.8');self.assertEqual(j.QUICK_RATES[-1],'2');self.assertIn('1.65',j.QUICK_RATES)
+        self.assertEqual(max(b.grid_info()['row'] for b in a.chip_btns.values()),2)
         a.rates_var.set('1.1');a._on_rate_slider(1.6499999);a.add_slider_rate();a.add_slider_rate()
         self.assertEqual(a.rates_var.get(),'1.1, 1.65')
         a._on_rate_slider(1.0);a.add_slider_rate()
@@ -270,6 +271,39 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(entry['options']['diffname'],'Edited name')
         self.assertEqual(entry['options']['artist'],'Edited artist')
         a.back_from_pack();pack.destroy()
+
+    def test_marathon_maker_songs_order_and_collage(self):
+        from PIL import Image
+        from marathon_maker import MarathonMaker
+        a=self.app;folder=Path(self.tmp.name)
+        charts=[]
+        for name,color,last in [('One','red',60000),('Two','blue',60000),('Long','green',120000)]:
+            Image.new('RGB',(160,90),color).save(folder/f'{name}.png')
+            path=folder/f'{name}.osu'
+            lines=['osu file format v14','[General]','Mode:3','AudioFilename:a.mp3','[Metadata]',f'Title:{name}','Creator:C','Version:Hard',
+                   '[Difficulty]','CircleSize:4','[Events]',f'0,0,"{name}.png",0,0','[HitObjects]','64,192,0,1,0,0:0:0:0:',f'64,192,{last},1,0,0:0:0:0:']
+            path.write_text(chr(10).join(lines)+chr(10))
+            charts.append(dict(path=str(path),title=name,creator='C',artist='A',version='Hard'))
+        a.open_marathon_maker();a.update()
+        setup=a.marathon_window;setup.name.set('Marathon');setup.creator.set('Me');setup.submit();a.update()
+        m=a.marathon_window;self.assertIsInstance(m,MarathonMaker)
+        for info in charts:m.selected=info;m.add()
+        m.rates.set('1.2');m.selected=charts[0];m.add();a.update()
+        self.assertEqual([e['info']['title'] for e in m.entries],['One','Two','Long','One'])
+        self.assertEqual(m.entries[3]['rate'].get(),'1.2')
+        self.assertEqual(m.layout_inputs()[0],[1,1,2,1])  # the 2-minute song gets a double slot
+        m.entries[0]['weight'].set('3');m.entries[1]['row'].set('2')
+        self.assertEqual(m.layout_inputs(),([3,1,2,1],[None,2,None,None]))
+        m.auto_layout();self.assertEqual(m.layout_inputs(),([1,1,2,1],[None,None,None,None]))
+        m.move(m.entries[2],-1);self.assertEqual([e['info']['title'] for e in m.entries],['One','Long','Two','One'])
+        m.draw_preview();a.update()
+        self.assertIn('4 songs',m.total_label.cget('text'))
+        m.remove(m.entries[3]);self.assertEqual(len(m.entries),3)
+        m.entries[0]['brk'].set('abc');m.build();self.assertIn('must be numbers',m.status.cget('text'))
+        a.back_from_pack();a.update()
+        self.assertFalse(m.winfo_ismapped());self.assertTrue(a.sidebar_btn.winfo_ismapped())
+        a.open_marathon_maker();a.update();self.assertTrue(m.winfo_ismapped())
+        a.back_from_pack();m.destroy()
 
     def test_side_popovers_and_folder_selection_stay_inside_app(self):
         from pack_maker import FolderPicker, Popover
