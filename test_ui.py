@@ -13,6 +13,7 @@ class InterfaceTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory()
         self.config_patch=patch.object(j,'CONFIG_PATH',str(Path(self.tmp.name)/'config.json'))
         self.config_patch.start()
+        Path(j.CONFIG_PATH).write_text('{"setup_complete": true, "follow_osu": false}')
         with patch.object(j,'find_songs_folder',return_value=None), patch.object(j,'find_ffmpeg',return_value=None), patch.object(j.App,'show_ffmpeg_setup'):
             self.app=j.App()
             self.app.update()
@@ -28,6 +29,25 @@ class InterfaceTests(unittest.TestCase):
         while time.monotonic()<until:
             self.app.update()
             time.sleep(.01)
+    def test_converter_follows_when_main_follow_is_off(self):
+        from test_generation import MAP
+        a=self.app
+        chart=Path(self.tmp.name)/'chart.osu'
+        chart.write_text(MAP)
+        a.maps=[j.read_header_info(str(chart))]
+        a._latest_osu_selection=dict(path=str(chart),folder=None,file=None,songs=None,bid=0,
+                                     artist=None,title=None,mapper=None,version=None,md5=None)
+        a.open_conversion();page=a.conversion_page
+        page.direction.set('osu!mania → StepMania')
+        try:
+            with patch.object(a,'update_follow_worker'):
+                page.change_direction()
+            self.assertTrue(page.follows_osu())
+            self.assertFalse(a.follow_var.get())
+            self.assertEqual(page.selected()[0]['path'],str(chart))
+            self.assertEqual(page.tree.cget('columns'),('song','diff','author'))
+        finally:a.back_from_conversion()
+
     def test_compact_mode_controls_geometry_and_return(self):
         a = self.app
         a.selected = dict(path='sample.osu', title='Song', artist='Artist', creator='Charter', version='Hard', bpm=180, od='8', keys=4)

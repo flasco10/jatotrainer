@@ -148,6 +148,43 @@ class ConversionTests(unittest.TestCase):
         objects=core.sec(sections,'HitObjects');self.assertIn(',1000,1,',objects[0]);self.assertIn(',2000,128,0,3000:',objects[1])
         self.assertEqual(core.kv(core.sec(sections,'General'),'PreviewTime'),'2000')
 
+    def test_strict_sync_accounts_for_rounded_bpm_change(self):
+        path=self.osu(objects='64,192,756,1,0,0:0:0:0:\n',
+                      timing='0,500,4,2,0,100,1,0\n506,250,4,2,0,100,1,0\n')
+        info=self.info(path,'osu_to_sm')[0]
+        model=osu_to_sm(core,info)
+        self.assertLess(model['sync_error'],2)
+        self.assertIn('240', model['song']['BPMS'])
+
+    def test_public_profile_embedded_user_becomes_small_rgba_cdtitle(self):
+        import io
+        from PIL import Image
+        from mapper_avatar import mapper_cdtitle
+        html=b'<div data-initial-data="{&quot;user&quot;:{&quot;username&quot;:&quot;Mapper&quot;,&quot;avatar_url&quot;:&quot;https://a.ppy.sh/7&quot;}}"></div>'
+        original=io.BytesIO()
+        Image.new('RGB',(128,64),'red').save(original,'PNG')
+        with patch('mapper_avatar._download',side_effect=[html,original.getvalue()]) as download:
+            result=mapper_cdtitle('Mapper')
+        self.assertTrue(download.call_args_list[0].args[0].endswith('/Mapper'))
+        self.assertEqual(download.call_args_list[1].args[0],'https://a.ppy.sh/7')
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual((image.size,image.mode),((64,32),'RGBA'))
+
+    def test_mapper_avatar_is_opt_in_and_failure_does_not_block_export(self):
+        info=self.info(self.osu(),'osu_to_sm')[0]
+        with patch('chart_conversion.mapper_cdtitle',return_value=b'avatar') as avatar:
+            normal=convert(core,[info],self.output,'osu_to_sm')
+            avatar.assert_not_called()
+            self.assertFalse((Path(normal['paths'][0])/'cdtitle.png').exists())
+            enabled=convert(core,[info],self.output,'osu_to_sm',include_cdtitle=True)
+            avatar.assert_called_once_with(info['creator'])
+            folder=Path(enabled['paths'][0]);song=simfile.open(str(folder/'charts.ssc'))
+            self.assertEqual((folder/song['CDTITLE']).read_bytes(),b'avatar')
+        with patch('chart_conversion.mapper_cdtitle',side_effect=ValueError('missing')):
+            fallback=convert(core,[info],self.output,'osu_to_sm',include_cdtitle=True)
+            self.assertEqual(fallback['charts'],1)
+            self.assertIn('mapper avatar skipped',' '.join(fallback['warnings']))
+
     def test_strict_sync_rejects_irregular_notes_and_reports_quantization(self):
         path=self.osu(objects='64,192,1007,1,0,0:0:0:0:\n')
         info=self.info(path,'osu_to_sm')[0]

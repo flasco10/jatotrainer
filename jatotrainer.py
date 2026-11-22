@@ -936,7 +936,11 @@ class App(ctk.CTk):
         self.busy = False
 
         self._build_ui()
-        if not self.ffmpeg:
+        first_run = not self.cfg.get("setup_complete", bool(self.cfg))
+        if first_run:
+            self.cfg["setup_complete"] = False
+            self.after_idle(self.show_initial_setup)
+        elif not self.ffmpeg:
             self.after_idle(self.show_ffmpeg_setup)
         self._poll_job = self.after(100, self._poll)
         if self.songs_dir:
@@ -946,6 +950,50 @@ class App(ctk.CTk):
             if lazer_detected():
                 msg += "\nNote: osu!lazer stores maps differently and isn't supported; this tool needs osu!stable."
             self.status.configure(text=msg)
+        self.update_follow_worker()
+
+    def show_initial_setup(self):
+        dialog = self._setup_dialog = ctk.CTkToplevel(self)
+        dialog.title("Welcome to Jatotrainer")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        ctk.CTkLabel(dialog,text="Welcome to Jatotrainer",font=ctk.CTkFont(size=24,weight="bold")).pack(padx=26,pady=(20,8))
+        ctk.CTkLabel(dialog,text="Choose your osu!stable Songs folder to index your charts. Follow osu! selects the active chart for you.",
+                     wraplength=420,justify="left").pack(padx=26,pady=(0,8))
+        self._setup_status=ctk.CTkLabel(dialog,text=self.status.cget("text"),wraplength=420)
+        self._setup_status.pack(padx=26,pady=8)
+        self._setup_progress=ctk.CTkProgressBar(dialog,width=410)
+        self._setup_progress.pack(padx=26,pady=8)
+        self._setup_progress.set(1 if self.songs_dir and not self.busy and self.maps else 0)
+        ctk.CTkSwitch(dialog,text="Follow osu!",variable=self.follow_var,command=self.toggle_follow).pack(anchor="w",padx=26,pady=8)
+        controls=ctk.CTkFrame(dialog,fg_color="transparent")
+        controls.pack(padx=26,pady=(8,20))
+
+        def choose():
+            path=filedialog.askdirectory(parent=dialog,title="Choose your osu!stable Songs folder")
+            if path and not self.busy:
+                self.songs_dir=normalize_songs_dir(path)
+                self.cfg["songs_dir"]=self.songs_dir
+                self.start_scan()
+
+        def done():
+            self.cfg.update(setup_complete=True,songs_dir=self.songs_dir,follow_osu=self.follow_var.get())
+            save_json(CONFIG_PATH,self.cfg)
+            dialog.destroy()
+            if not self.ffmpeg:self.show_ffmpeg_setup()
+
+        self._setup_browse=ctk.CTkButton(controls,text="Choose Songs folder…",command=choose)
+        self._setup_browse.pack(side="left",padx=5)
+        ctk.CTkButton(controls,text="Continue",width=100,command=done).pack(side="left",padx=5)
+        self._setup_browse.configure(state="disabled" if self.busy else "normal")
+        dialog.protocol("WM_DELETE_WINDOW",done)
+
+    def setup_progress(self,text,value=None,done=False):
+        dialog=getattr(self,"_setup_dialog",None)
+        if dialog and dialog.winfo_exists():
+            self._setup_status.configure(text=text)
+            if value is not None:self._setup_progress.set(value)
+            self._setup_browse.configure(state="normal" if done else "disabled")
 
     def show_ffmpeg_setup(self):
         if getattr(self, "_ffmpeg_dialog", None) and self._ffmpeg_dialog.winfo_exists():
@@ -1064,7 +1112,7 @@ class App(ctk.CTk):
                                          border_width=1, border_color="#293147",
                                         command=self.detect_current)
         self.detect_btn.grid(row=0, column=3, rowspan=2, padx=(10, 0))
-        self.follow_var = tk.BooleanVar(value=False)
+        self.follow_var = tk.BooleanVar(value=self.cfg.get("follow_osu",True))
         ctk.CTkSwitch(header, text="Follow osu!", variable=self.follow_var,
                       progress_color=ACCENT, command=self.toggle_follow).grid(
                           row=0, column=4, rowspan=2, padx=(18, 20))
@@ -1296,7 +1344,7 @@ class App(ctk.CTk):
         self.compact.grid(row=0, column=0, columnspan=2, rowspan=2, sticky="nsew")
         if not self.follow_var.get():
             self.follow_var.set(True)
-            self.toggle_follow()
+            self.update_follow_worker()
         self.compact.refresh()
 
     def exit_compact(self):
@@ -1317,7 +1365,7 @@ class App(ctk.CTk):
             widget.grid()
         self._apply_sidebar()
         self.follow_var.set(self._full_follow)
-        self.toggle_follow()
+        self.update_follow_worker()
         self.on_options_changed()
 
     def open_conversion(self):
@@ -1325,9 +1373,11 @@ class App(ctk.CTk):
         if not hasattr(self, "conversion_page") or not self.conversion_page.winfo_exists():
             self.conversion_page = ConversionPage(self, sys.modules[__name__])
         self.show_pack_page(self.conversion_page)
+        self.conversion_page.toggle_follow()
 
     def back_from_conversion(self):
         self.conversion_page.active = False
+        self.update_follow_worker()
         self.conversion_page.grid_remove()
         self.back_from_pack()
 
@@ -1434,6 +1484,7 @@ class App(ctk.CTk):
         self._scan_selected_path = (self.selected or {}).get('path')
         self.status.configure(text=f"Scanning {self.songs_dir} …")
         self.count_lbl.configure(text="Scanning…")
+        self.setup_progress(f"Scanning {self.songs_dir} …",0)
         self.on_options_changed()
 
         def work():
@@ -1543,32 +1594,47 @@ class App(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     def toggle_follow(self):
-        if self.follow_var.get():
-            self.follow_gen = getattr(self, "follow_gen", 0) + 1
-            gen = self.follow_gen
-
-            def loop():
-                last = None
-                warned = False
-                while self.follow_gen == gen:
-                    sel = current_selection()
-                    if sel is None and not warned:
-                        self.q.put(("follow_err",))
-                        warned = True
-                        last = None
-                    elif sel is not None:
-                        warned = False
-                    key = tuple((sel or {}).get(field) for field in
-                                ("path", "folder", "file", "bid", "artist", "title", "version"))
-                    if sel and key != last:
-                        last = key
-                        self.q.put(("follow", sel))
-                    time.sleep(1.0)
-
-            threading.Thread(target=loop, daemon=True).start()
+        if not getattr(self,"compact_active",False):
+            self.cfg["follow_osu"]=self.follow_var.get()
+            save_json(CONFIG_PATH,self.cfg)
+        self.update_follow_worker()
+        if self.follow_var.get() and not self.busy:
             self.status.configure(text="Following osu! … pick a map in-game and it'll appear here.")
-        else:
-            self.follow_gen = getattr(self, "follow_gen", 0) + 1
+
+    def update_follow_worker(self):
+        page=getattr(self,"conversion_page",None)
+        enabled=self.follow_var.get() or (page is not None and page.winfo_exists() and page.follows_osu())
+        enabled=bool(enabled)
+        if enabled == getattr(self,"_follow_running",False):
+            return
+        self._follow_running=enabled
+        self.follow_gen=getattr(self,"follow_gen",0)+1
+        if not enabled:
+            self._latest_osu_selection=None
+            return
+        gen=self.follow_gen
+
+        def loop():
+            last=None
+            warned=False
+            while self.follow_gen==gen:
+                try:sel=current_selection()
+                except (ValueError,OSError):sel=None
+                if self.follow_gen!=gen:return
+                if sel is None:
+                    if not warned:self.q.put(("follow_err",gen))
+                    warned=True
+                    last=None
+                else:
+                    warned=False
+                    key=tuple(sel.get(field) for field in
+                              ("path","folder","file","bid","artist","title","version","md5"))
+                    if key!=last:
+                        last=key
+                        self.q.put(("follow",sel,gen))
+                time.sleep(1)
+
+        threading.Thread(target=loop,daemon=True).start()
 
     # ---- options ---- #
     def _od_override(self):
@@ -1609,14 +1675,8 @@ class App(ctk.CTk):
         rows = max(1, math.ceil(len(rates) / columns)) if rates else 0
         h = rate_y + (rows-1)*48 + 38 + 18 if rates else label_y+38
         c.configure(height=h)
-        image = Image.new("RGB", (w, h), "#171d30")
-        if self.background_image is not None:
-            image = ImageOps.fit(self.background_image, (w, h), method=Image.Resampling.LANCZOS)
-            image = Image.blend(image, Image.new("RGB", (w, h), "#111322"), .58)
-        mask = Image.new("L", (w, h))
-        ImageDraw.Draw(mask).rounded_rectangle((1,1,w-2,h-2),radius=24,fill=255)
-        image.putalpha(mask)
-        ImageDraw.Draw(image).rounded_rectangle((2,2,w-3,h-3),radius=24,outline="#9c95aa",width=3)
+        from ui_components import chart_backdrop
+        image = chart_backdrop(self.background_image,w,h)
         self.card_image = ImageTk.PhotoImage(image)
         background=c.create_image(0,0,image=self.card_image,anchor="nw")
         c.tag_lower(background)
@@ -1761,7 +1821,14 @@ class App(ctk.CTk):
                     self._detecting = False
                     self.status.configure(text=f"Detection failed: {msg[1]}")
                 elif k == "follow":
-                    selection = msg[1]
+                    if len(msg)>2 and msg[2]!=self.follow_gen:
+                        continue
+                    selection = self._latest_osu_selection = msg[1]
+                    page=getattr(self,"conversion_page",None)
+                    if page is not None and page.winfo_exists():
+                        page.follow_selection(selection)
+                    if not self.follow_var.get():
+                        continue
                     found, _ = match_selection(self.maps, selection, self.songs_dir)
                     key = tuple(selection.get(field) for field in ('folder', 'file', 'path', 'title', 'version'))
                     if not found and self.songs_dir and key != getattr(self, '_missing_scan_key', None):
@@ -1772,12 +1839,23 @@ class App(ctk.CTk):
                     else:
                         self.status.configure(text=self.apply_selection(selection, "Following osu!"))
                 elif k == "follow_err":
+                    if len(msg)>1 and msg[1]!=self.follow_gen:
+                        continue
+                    self._latest_osu_selection=None
+                    if not self.follow_var.get() or self.busy or not self.songs_dir:
+                        continue
                     self.status.configure(text="No selected chart detected. Start osu!stable and select a chart. tosu also works as a fallback.")
                 elif k == "scanprog":
-                    self.count_lbl.configure(text=f"Scanning… {msg[1]}/{msg[2]} folders")
+                    label=f"Scanning… {msg[1]}/{msg[2]} folders"
+                    self.setup_progress(label,msg[1]/max(1,msg[2]))
+                    self.count_lbl.configure(text=label)
                 elif k == "scandone":
                     self.busy = False
                     self.maps, st = msg[1], msg[2]
+                    self.setup_progress(f"Scan complete: {st['mania']} osu!mania difficulties found.",1,done=True)
+                    page=getattr(self,"conversion_page",None)
+                    if page is not None and page.winfo_exists():
+                        page.follow_selection(getattr(self,"_latest_osu_selection",None))
                     self.refresh_list()
                     selected_path = getattr(self, '_scan_selected_path', None)
                     if selected_path:
@@ -1799,6 +1877,7 @@ class App(ctk.CTk):
                     self.on_options_changed()
                 elif k == "scanerr":
                     self.busy = False
+                    self.setup_progress(f"Scan failed: {msg[1]}",0,done=True)
                     self.status.configure(text=f"Scan failed: {msg[1]}")
         except queue.Empty:
             pass
