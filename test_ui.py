@@ -16,12 +16,18 @@ class InterfaceTests(unittest.TestCase):
         Path(j.CONFIG_PATH).write_text('{"setup_complete": true, "follow_osu": false}')
         with patch.object(j,'find_songs_folder',return_value=None), patch.object(j,'find_ffmpeg',return_value=None), patch.object(j.App,'show_ffmpeg_setup'):
             self.app=j.App()
+            # Fully transparent but still mapped: real layout for the checks, nothing flashes on screen.
+            # Set JATO_SHOW_TEST_WINDOWS=1 to watch the tests run.
+            if not os.environ.get('JATO_SHOW_TEST_WINDOWS'):
+                self.app.attributes('-alpha', 0.0)
             self.app.update()
     def tearDown(self):
         # Stop Tk timers before destroying widgets.
         for job in self.app.tk.call("after", "info"):
             self.app.tk.call("after", "cancel", job)
         self.app.destroy()
+        # Free the destroyed app's Tk fonts here; if a later test's worker thread collects them, it blocks on Tk.
+        import gc; gc.collect()
         self.config_patch.stop()
         self.tmp.cleanup()
     def pump(self):
@@ -29,6 +35,34 @@ class InterfaceTests(unittest.TestCase):
         while time.monotonic()<until:
             self.app.update()
             time.sleep(.01)
+    def test_rate_presets_slider_and_ignored_input(self):
+        a=self.app
+        self.assertEqual(j.QUICK_RATES[0],'0.8');self.assertEqual(j.QUICK_RATES[-1],'2');self.assertIn('1.65',j.QUICK_RATES)
+        self.assertEqual(max(b.grid_info()['row'] for b in a.chip_btns.values()),2)
+        a.rates_var.set('1.1');a._on_rate_slider(1.6499999);a.add_slider_rate();a.add_slider_rate()
+        self.assertEqual(a.rates_var.get(),'1.1, 1.65')
+        a._on_rate_slider(1.0);a.add_slider_rate()
+        self.assertEqual(a.rates_var.get(),'1.1, 1.65')
+        a.rates_var.set('1.2, abc, 7, 1')
+        self.assertEqual(a.parse_rates(),[1.2])
+        self.assertIn('abc, 7, 1',a.rates_warning.cget('text'))
+        a.rates_var.set('1.2, 1.3')
+        self.assertEqual(a.rates_warning.cget('text'),'')
+    def test_bitrate_defaults_to_192_and_warns_above(self):
+        self.assertEqual(self.app._bitrate(),192)
+        self.assertEqual(self.app.bitrate_warning.cget('text'),'')
+        self.app.bitrate_var.set('320 kbps')
+        self.assertEqual(self.app._bitrate(),320)
+        self.assertIn('Bancho',self.app.bitrate_warning.cget('text'))
+    def test_update_button_appears_and_portable_opens_page(self):
+        a=self.app
+        self.assertFalse(a.update_btn.winfo_ismapped())
+        a.show_update(dict(version='9.0.0',page='https://example/rel',size=0));a.update()
+        self.assertTrue(a.update_btn.winfo_ismapped())
+        self.assertEqual(a.update_btn.cget('text'),'Update to v9.0.0')
+        with patch.object(j.webbrowser,'open') as opened:
+            a.start_update()  # running from source = not installed
+        opened.assert_called_once_with('https://example/rel')
     def test_converter_follows_when_main_follow_is_off(self):
         from test_generation import MAP
         a=self.app
@@ -270,6 +304,93 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(entry['options']['diffname'],'Edited name')
         self.assertEqual(entry['options']['artist'],'Edited artist')
         a.back_from_pack();pack.destroy()
+
+    def test_marathon_maker_songs_order_and_collage(self):
+        from PIL import Image
+        from marathon_maker import MarathonMaker
+        a=self.app;folder=Path(self.tmp.name)
+        charts=[]
+        for name,color,last in [('One','red',60000),('Two','blue',60000),('Long','green',120000)]:
+            Image.new('RGB',(160,90),color).save(folder/f'{name}.png')
+            path=folder/f'{name}.osu'
+            lines=['osu file format v14','[General]','Mode:3','AudioFilename:a.mp3','[Metadata]',f'Title:{name}','Creator:C','Version:Hard',
+                   '[Difficulty]','CircleSize:4','[Events]',f'0,0,"{name}.png",0,0','[HitObjects]','64,192,0,1,0,0:0:0:0:',f'64,192,{last},1,0,0:0:0:0:']
+            path.write_text(chr(10).join(lines)+chr(10))
+            charts.append(dict(path=str(path),title=name,creator='C',artist='A',version='Hard'))
+        a.open_marathon_maker();a.update()
+        setup=a.marathon_window;setup.name.set('Marathon');setup.creator.set('Me');setup.submit();a.update()
+        m=a.marathon_window;self.assertIsInstance(m,MarathonMaker)
+        for info in charts:m.selected=info;m.add()
+        m.rates.set('1.2');m.selected=charts[0];m.add();a.update()
+        self.assertEqual([e['info']['title'] for e in m.entries],['One','Two','Long','One'])
+        self.assertEqual(m.entries[3]['rate'].get(),'1.2')
+        self.assertEqual(m.layout_inputs()[0],[1,1,2,1])  # the 2-minute song gets a double slot
+        m.entries[0]['weight'].set('3');m.entries[1]['row'].set('2')
+        self.assertEqual(m.layout_inputs(),([3,1,2,1],[None,2,None,None]))
+        m.auto_layout();self.assertEqual(m.layout_inputs(),([1,1,2,1],[None,None,None,None]))
+        m.move(m.entries[2],-1);self.assertEqual([e['info']['title'] for e in m.entries],['One','Long','Two','One'])
+        m.draw_preview();a.update()
+        self.assertIn('4 songs',m.total_label.cget('text'))
+        self.assertEqual(m.per_row_value(),4);m.per_row.set('All in one row');self.assertIsNone(m.per_row_value())
+        m.per_row.set('4');m.draw_preview();a.update()
+        from types import SimpleNamespace as E
+        ed=m.preview_canvas;centre=lambda i:(ed.rects[i][0]+ed.rects[i][2]//2,ed.rects[i][1]+ed.rects[i][3]//2)
+        # Dragging a tile right pans its picture right (focus moves toward the left edge).
+        x,y=centre(0);ed.press(E(x=x,y=y));self.assertEqual(m.selected_tile,0)
+        ed.motion(E(x=x+30,y=y));ed.release(E(x=x+30,y=y))
+        self.assertLess(m.focus_values()[0][0],0.5)
+        ed.wheel(E(x=x,y=y,delta=120));self.assertGreater(m.focus_values()[0][2],1.0)
+        ed.double(E(x=x,y=y));self.assertEqual(m.focus_values()[0],(0.5,0.5,1.0))
+        # The top bar is the move zone; the rest of the tile is the pan zone.
+        bx,by=ed.rects[0][0]+10,ed.rects[0][1]+10;tx,ty=centre(2)
+        self.assertEqual(ed.zone_at(bx,by),(0,'handle'));self.assertEqual(ed.zone_at(tx,ty),(2,'pan'))
+        ed.hover_move(E(x=bx,y=by));self.assertEqual(ed.cget('cursor'),'hand2')
+        # Dragging tile 1's bar onto tile 3 moves that song to position 3 (play order too).
+        cards={id(e):e['card'] for e in m.entries}
+        ed.press(E(x=bx,y=by));ed.motion(E(x=tx,y=ty))
+        self.assertEqual(ed.target,2);self.assertIsNotNone(ed.preview_rects)  # new order shown before the drop
+        ed.release(E(x=tx,y=ty))
+        self.assertEqual([e['info']['title'] for e in m.entries],['Long','Two','One','One'])
+        self.assertEqual(m.selected_tile,2)
+        # Reordering reuses the song cards (rebuilding them froze the UI for ~1 s) and renumbers them.
+        self.assertTrue(all(e['card'] is cards[id(e)] for e in m.entries))
+        self.assertEqual([e['card'].number.cget('text') for e in m.entries],['1','2','3','4'])
+        # Panning never reorders, even when the mouse ends up over another tile.
+        m.draw_preview();a.update()  # the move's scheduled redraw
+        x,y=centre(1);tx,ty=centre(3)
+        ed.press(E(x=x,y=y));ed.motion(E(x=tx,y=ty));ed.release(E(x=tx,y=ty))
+        self.assertEqual([e['info']['title'] for e in m.entries],['Long','Two','One','One'])
+        self.assertNotEqual(m.focus_values()[1][0],0.5)
+        hx,hy=centre(1);ed.hover_move(E(x=hx,y=hy));self.assertEqual((ed.hover,ed.hover_zone),(1,'pan'))
+        self.assertEqual(ed.cget('cursor'),'sb_h_double_arrow')  # this tile only has room to pan sideways
+        ed.hover_move(E(x=centre(2)[0],y=centre(2)[1]));self.assertEqual(ed.cget('cursor'),'arrow')  # exact fit: nothing to pan
+        m.set_image(0,str(folder/'One.png'));self.assertEqual(m.entries[0]['image'],str(folder/'One.png'))
+        self.assertEqual(m.entries[0]['thumb'].getpixel((0,0)),(255,0,0))
+        m.set_image(0,None);self.assertIsNone(m.entries[0]['image'])
+        big=m.open_editor();a.update();self.assertEqual(len(big.rects),4)
+        a._active_popover.destroy();a.update()
+        m.select_tile(3);ed.event_generate('<Delete>');self.assertEqual(len(m.entries),3)  # Delete removes the selected song
+        # The song list ticks charts already added; double-click adds the highlighted one.
+        m.maps=[dict(c,gen=False) for c in charts];m.search.set('');a.update()
+        self.assertTrue(m.tree.set('0','title').startswith('✓ '))
+        m.tree.selection_set('2');m.tree.focus_set();m.tree.event_generate('<Return>');self.assertEqual(len(m.entries),4)  # same handler as double-click
+        # Name and bitrate are on the page; bitrates above 192 warn inline.
+        self.assertTrue(m.compression_button.winfo_manager()=='' )
+        m.bitrate.set('320 kbps');self.assertIn('192',m.bitrate_warning.cget('text'))
+        m.bitrate.set('192 kbps');self.assertEqual(m.bitrate_warning.cget('text'),'')
+        m.remove(m.entries[3]);self.assertEqual(len(m.entries),3)
+        # One break value for every gap; songs added later start with it.
+        m.default_break.set('5');m.apply_break_to_all()
+        self.assertEqual({e['brk'].get() for e in m.entries},{'5'})
+        m.default_break.set('-1');m.apply_break_to_all();self.assertIn('0–600',m.status.cget('text'))
+        self.assertEqual({e['brk'].get() for e in m.entries},{'5'})
+        m.default_break.set('2.5');m.apply_break_to_all();m.selected=charts[1];m.add()
+        self.assertEqual(m.entries[-1]['brk'].get(),'2.5');m.remove(m.entries[-1])
+        m.entries[0]['brk'].set('abc');m.build();self.assertIn('must be numbers',m.status.cget('text'))
+        a.back_from_pack();a.update()
+        self.assertFalse(m.winfo_ismapped());self.assertTrue(a.sidebar_btn.winfo_ismapped())
+        a.open_marathon_maker();a.update();self.assertTrue(m.winfo_ismapped())
+        a.back_from_pack();m.destroy()
 
     def test_side_popovers_and_folder_selection_stay_inside_app(self):
         from pack_maker import FolderPicker, Popover

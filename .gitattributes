@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# MSYS2 bash runs these, so keep LF even on Windows checkouts.
+*.sh text eol=lf
+SHA256SUMS text eol=lf

@@ -1,5 +1,8 @@
 #define AppName "jatotrainer"
-#define AppVersion "1.5.0"
+; CI passes /DAppVersion=<tag>; local builds use this default.
+#ifndef AppVersion
+  #define AppVersion "1.6.0"
+#endif
 
 [Setup]
 AppId={{7C6A5D83-BAC3-41AA-BAA4-D6382FC1D287}
@@ -35,3 +38,5 @@ Name: "{autodesktop}\jatotrainer"; Filename: "{app}\jatotrainer.exe"; WorkingDir
 
 [Run]
 Filename: "{app}\jatotrainer.exe"; Description: "Launch jatotrainer"; Flags: nowait postinstall skipifsilent
+; In-app updates install silently, so reopen the app afterwards.
+Filename: "{app}\jatotrainer.exe"; Flags: nowait; Check: WizardSilent

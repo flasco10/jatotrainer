@@ -116,6 +116,10 @@ class PackSetup(Popover):
 
 
 class PackMaker(ctk.CTkFrame):
+    # Overridden by the marathon maker, which reuses this page's chart browser.
+    TITLE='Pack maker';CARDS_LABEL='Charts in pack · edit rates per chart';BUILD_TEXT='Create pack'
+    RATES_DEFAULT='1';RATES_HINT='Rates: 1 = original; e.g. 1, 1.1, 1.25';ADD_TEXT='Add chart';ARTIST_OPTIONS=True;SETTINGS_PREFIX='Pack'
+
     def __init__(self,app,core,name,creator,od,hp):
         super().__init__(app, fg_color=core.BG_MAIN)
         self.app,self.core=app,core
@@ -126,18 +130,19 @@ class PackMaker(ctk.CTkFrame):
         header=ctk.CTkFrame(self,fg_color=core.BG_PANEL);header.grid(row=0,column=0,columnspan=2,sticky='ew',padx=16,pady=12)
         self.back_button=ctk.CTkButton(header,text='‹ Back',width=80,command=app.back_from_pack)
         self.back_button.pack(side='left',padx=(12,0))
-        ctk.CTkLabel(header,text='Pack maker',font=ctk.CTkFont(size=24,weight='bold')).pack(side='left',padx=16,pady=12)
+        ctk.CTkLabel(header,text=self.TITLE,font=ctk.CTkFont(size=24,weight='bold')).pack(side='left',padx=16,pady=12)
         self.name=tk.StringVar(value=name);self.creator=tk.StringVar(value=creator)
         for label,var in [('Name',self.name),('Creator',self.creator)]:
             ctk.CTkLabel(header,text=label).pack(side='left',padx=8)
             ctk.CTkEntry(header,textvariable=var,width=180).pack(side='left')
         settings=ctk.CTkFrame(self,fg_color='transparent');settings.grid(row=1,column=0,columnspan=2,sticky='ew',padx=16)
+        self.settings_row=settings
         self.od=tk.StringVar(value=format(od,'g'));self.hp=tk.StringVar(value=format(hp,'g'))
         self.various=tk.BooleanVar(value=False);self.include_artist=tk.BooleanVar(value=False);self.quality=tk.StringVar(value='Original');self.backgrounds_8bit=tk.BooleanVar(value=False)
-        for label,var in [('Pack OD',self.od),('Pack HP',self.hp)]:
+        for label,var in [(self.SETTINGS_PREFIX+' OD',self.od),(self.SETTINGS_PREFIX+' HP',self.hp)]:
             ctk.CTkLabel(settings,text=label).pack(side='left',padx=8)
             ctk.CTkEntry(settings,textvariable=var,width=60).pack(side='left')
-        ctk.CTkSwitch(settings,text='Various Artists',variable=self.various).pack(side='left',padx=16)
+        if self.ARTIST_OPTIONS:ctk.CTkSwitch(settings,text='Various Artists',variable=self.various).pack(side='left',padx=16)
         self.compression_button=ctk.CTkButton(settings,text='Compression ⚙',width=150,command=self.compression_options)
         self.compression_button.pack(side='right',padx=8)
         self.include_artist_switch=ctk.CTkSwitch(settings,text='Include artist in diffname',variable=self.include_artist)
@@ -163,21 +168,27 @@ class PackMaker(ctk.CTkFrame):
         sb=ctk.CTkScrollbar(tf,command=self.tree.yview);self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side='left',fill='both',expand=True);sb.pack(side='right',fill='y')
         self.tree.bind('<<TreeviewSelect>>',self.choose)
+        # Double-click or Enter adds the highlighted chart at the rate in the box.
+        self.tree.bind('<Double-1>',lambda _:(self.choose(),self.add()))
+        self.tree.bind('<Return>',lambda _:(self.choose(),self.add()))
         self.card=ChartCard(self.left,self,None,preview=True)
         self.card.grid(row=4,column=0,sticky='ew',padx=16,pady=6)
         addrow=ctk.CTkFrame(self.left,fg_color='transparent');addrow.grid(row=5,column=0,sticky='ew',padx=12,pady=(0,12))
-        self.rates=tk.StringVar(value='1')
+        self.rates=tk.StringVar(value=self.RATES_DEFAULT)
         ctk.CTkEntry(addrow,textvariable=self.rates,width=170).pack(side='left')
-        ctk.CTkButton(addrow,text='Add chart',command=self.add).pack(side='left',padx=8)
-        ctk.CTkLabel(self.left,text='Rates: 1 = original; e.g. 1, 1.1, 1.25',text_color='#94a3b8').grid(row=6,column=0,pady=(0,8))
-        self.cards=ctk.CTkScrollableFrame(self,fg_color=core.BG_PANEL,label_text='Charts in pack · edit rates per chart')
+        ctk.CTkButton(addrow,text=self.ADD_TEXT,command=self.add).pack(side='left',padx=8)
+        ctk.CTkLabel(self.left,text=self.RATES_HINT,text_color='#94a3b8').grid(row=6,column=0,pady=(0,8))
+        self.cards=ctk.CTkScrollableFrame(self,fg_color=core.BG_PANEL,label_text=self.CARDS_LABEL)
         self.cards.grid(row=2,column=1,sticky='nsew',padx=(8,16),pady=12);self.cards.grid_columnconfigure(0,weight=1)
         footer=ctk.CTkFrame(self,fg_color=core.BG_PANEL);footer.grid(row=3,column=0,columnspan=2,sticky='ew',padx=16,pady=(0,12))
-        self.build_button=ctk.CTkButton(footer,text='Create pack',height=40,command=self.build);self.build_button.pack(fill='x',padx=12,pady=10)
+        self.build_button=ctk.CTkButton(footer,text=self.BUILD_TEXT,height=40,command=self.build);self.build_button.pack(fill='x',padx=12,pady=10)
         self.progress=ctk.CTkProgressBar(footer,progress_color=core.ACCENT);self.progress.set(0);self.progress.pack(fill='x',padx=12)
         self.status=ctk.CTkLabel(footer,text='Output: Various Artists - '+name,wraplength=1050);self.status.pack(padx=12,pady=6)
         self.refresh();self._poll_job=self.after(100,self.poll);self._follow_job=self.after(1000,self.follow_tick)
         if not self.maps and self.songs.get():self.scan()
+
+    def done_message(self,path,count):
+        return f'Created {count} charts in {path} · Refresh osu! with F5.'
 
     def artist_options_visibility(self):
         if self.various.get():
@@ -216,7 +227,21 @@ class PackMaker(ctk.CTkFrame):
         words=self.search.get().lower().split()
         self.visible=[m for m in self.maps if not m.get('gen') and all(w in ' '.join(str(m.get(k,'')) for k in ('artist','title','version','creator')).lower() for w in words)][:self.core.LIST_LIMIT]
         self.tree.delete(*self.tree.get_children())
-        for i,m in enumerate(self.visible):self.tree.insert('','end',iid=str(i),values=(m['title'],m['version'],m['creator']))
+        added=self.added_paths()
+        for i,m in enumerate(self.visible):self.tree.insert('','end',iid=str(i),values=(self.list_title(m,added),m['version'],m['creator']))
+
+    def added_paths(self):
+        return {e['info']['path'] for e in self.entries}
+
+    @staticmethod
+    def list_title(m,added):
+        return ('✓ ' if m['path'] in added else '')+m['title']
+
+    def mark_added(self):
+        """Tick charts already in the list without rebuilding it (keeps the selection)."""
+        added=self.added_paths()
+        for i,m in enumerate(getattr(self,'visible',[])):
+            if self.tree.exists(str(i)):self.tree.set(str(i),'title',self.list_title(m,added))
 
     def choose(self,_=None):
         selection=self.tree.selection()
@@ -268,6 +293,7 @@ class PackMaker(ctk.CTkFrame):
         if not self.busy:self.entries.remove(entry);self.render_entries()
 
     def render_entries(self):
+        self.mark_added()
         for child in self.cards.winfo_children():child.destroy()
         for i,entry in enumerate(self.entries):
             card=ChartCard(self.cards,self,entry)
@@ -329,7 +355,7 @@ class PackMaker(ctk.CTkFrame):
                 elif msg[0]=='progress':self.progress.set(msg[1]);self.status.configure(text=msg[2])
                 elif msg[0]=='done':
                     self.busy=False;self.build_button.configure(state='normal');self.progress.set(1);self.progress.configure(progress_color='#34d399')
-                    self.status.configure(text=f'Created {msg[2]} charts in {msg[1]} · Refresh osu! with F5.')
+                    self.status.configure(text=self.done_message(msg[1],msg[2]))
                 elif msg[0]=='error':
                     self.busy=False;self.build_button.configure(state='normal');self.progress.configure(progress_color='#fb7185');self.status.configure(text=msg[1])
         except queue.Empty:pass

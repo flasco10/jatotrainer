@@ -98,8 +98,8 @@ class GenerationTests(unittest.TestCase):
     def generate(self, rates=(1.25,), pitch=False, fmt='{diff} ({rate}x)', ff='fake'):
         return list(m.generate(self.info, rates, fmt, pitch, False, lambda s: None, ff))
     @staticmethod
-    def fake_audio(ff, src, dst, rate, pitch):
-        pathlib.Path(dst).write_bytes(f'{rate}:{pitch}'.encode())
+    def fake_audio(ff, src, dst, rate, pitch, bitrate=m.DEFAULT_BITRATE):
+        pathlib.Path(dst).write_bytes(f'{rate}:{pitch}:{bitrate}'.encode())
     def maps(self):
         return sorted(p for p in self.root.glob('*.osu') if p != self.path)
     def test_new_audio_uses_central_cache_without_sidecars(self):
@@ -111,6 +111,35 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(records[m._audio_cache_key(audio)]['sha256'],m._file_digest(audio))
         with patch.object(m, 'make_audio', side_effect=AssertionError('must reuse')):
             self.generate()
+    def test_bitrate_defaults_to_192_and_is_part_of_cache_identity(self):
+        calls=[]
+        with patch.object(m, 'make_audio', lambda *a, **k: (calls.append(k['bitrate']), self.fake_audio(*a, **k))):
+            self.generate()
+            list(m.generate(self.info, (1.25,), '{diff} ({rate}x)', False, False, lambda s: None, 'fake', bitrate=320))
+        self.assertEqual(calls, [192, 320])
+        self.assertEqual(len(list(self.root.glob('*.mp3'))), 2)
+    def test_rates_encode_in_parallel_and_publish_in_order(self):
+        import threading
+        barrier=threading.Barrier(3, timeout=10)  # deadlocks (BrokenBarrierError) if encodes run one at a time
+        def fake(*a, **k):
+            barrier.wait(); self.fake_audio(*a, **k)
+        outputs=[]
+        with patch.object(m, 'make_audio', fake):
+            done=list(m.generate(self.info, (1.3, 1.1, 1.2), '{diff} ({rate}x)', False, False, lambda s: None, 'fake', result=outputs.append))
+        self.assertEqual(done, [1.3, 1.1, 1.2])
+        self.assertEqual([o['rate'] for o in outputs], [1.3, 1.1, 1.2])
+        self.assertFalse(list(self.root.glob('.mmr-*')))
+    def test_failed_rate_cleans_up_other_running_encodes(self):
+        import time
+        def fake(ff, src, dst, rate, pitch, bitrate=192):
+            pathlib.Path(dst).write_bytes(b'partial')
+            if rate == 1.1: raise RuntimeError('conversion failed')
+            time.sleep(0.3)
+        with patch.object(m, 'make_audio', fake), self.assertRaises(RuntimeError):
+            list(m.generate(self.info, (1.1, 1.2, 1.3), '{diff} ({rate}x)', False, False, lambda s: None, 'fake'))
+        self.assertFalse(self.maps())
+        self.assertFalse(list(self.root.glob('.mmr-*')))
+        self.assertFalse(list(self.root.glob('*.mp3')))
     def test_sidecar_migration_preserves_audio_and_reuses_it(self):
         with patch.object(m, 'make_audio', self.fake_audio): self.generate()
         audio=next(self.root.glob('*.mp3')); original=audio.read_bytes()
@@ -202,7 +231,7 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(old.read_text(), 'user edit')
         self.assertEqual(len(self.maps()), 2)
     def test_audio_failure_leaves_no_map_or_temporary(self):
-        def fail(*args):
+        def fail(*args, **kwargs):
             pathlib.Path(args[2]).write_bytes(b'partial')
             raise RuntimeError('conversion failed')
         with patch.object(m, 'make_audio', fail), self.assertRaises(RuntimeError):
@@ -232,6 +261,21 @@ class GenerationTests(unittest.TestCase):
         for rate in [0, 1, 6, float('nan'), float('inf')]:
             with self.assertRaises(ValueError): self.generate((rate,))
         self.assertFalse(self.maps())
+    def test_header_reader_stops_early_but_handles_unusual_order(self):
+        path = self.root / 'odd.osu'
+        def chart(*lines):
+            path.write_text('\n'.join(('osu file format v14',) + lines) + '\n')
+            return m.read_header_info(str(path))
+        # Metadata after TimingPoints: the reader must not stop at the first red line.
+        info = chart('[General]', 'Mode: 3', '[TimingPoints]', '0,250,4,1,0,100,1,0',
+                     '[Metadata]', 'Title:Late', 'Version:X', '[Difficulty]', 'CircleSize:7', '[HitObjects]')
+        self.assertEqual((info['title'], info['keys'], info['bpm']), ('Late', 7, 240))
+        self.assertIsNone(chart('[General]', 'Mode: 0', '[Metadata]', 'Title:Std'))
+        # Inherited lines before the first red line are skipped for BPM, as before.
+        info = chart('[General]', 'Mode: 3', '[Metadata]', 'Title:T', '[Difficulty]', 'CircleSize:4', '[TimingPoints]',
+                     '0,-100,4,1,0,100,0,0', '10,500,4,1,0,100,1,0', '20,300,4,1,0,100,1,0')
+        self.assertEqual(info['bpm'], 120)
+
     def test_cache_same_mtime_modified_metadata(self):
         songs=self.root/'Songs'; folder=songs/'set'; folder.mkdir(parents=True)
         path=folder/'map.osu'; path.write_text(MAP)
@@ -243,7 +287,7 @@ class GenerationTests(unittest.TestCase):
             second,_=m.scan_songs(songs)
         self.assertEqual(first[0]['title'], 'T')
         self.assertEqual(second[0]['title'], 'Changed')
-    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg unavailable')
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg or ffprobe unavailable')
     def test_real_audio_speed_and_pitch_at_both_sample_rates(self):
         # A 1 kHz sine should become 1.25 kHz in pitch mode and stay 1 kHz
         # in tempo mode, with duration divided by 1.25 in both cases.
