@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 
 from ffmpeg_setup import DOWNLOAD_URL, EXE_NAME, install_ffmpeg, managed_ffmpeg_path
+import ln_transform
 import osu_db
 import updater
 
@@ -661,28 +662,36 @@ def safe_name(s):
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", s).rstrip(" .")
 
 
-def format_version(fmt, orig_ver, rate, orig_bpm, od):
-    return fmt.format(
+def format_version(fmt, orig_ver, rate, orig_bpm, od, ln=""):
+    text = fmt.format(
         diff=orig_ver, rate=fmt_rate(rate), bpm=int(round(orig_bpm * rate)),
         bpm_orig=int(round(orig_bpm)), od=od, pct=f"{int(round((rate - 1) * 100)):+d}",
+        ln=ln,
     )
+    if ln and "{ln" not in fmt:
+        text = f"{text} [{ln}]"
+    return text
 
 
-def build_rate(header, sections, rate, fmt, scale_od_flag, audio_name=None, od_override=None, hp_override=None):
-    validate_rate(rate)
+def build_rate(header, sections, rate, fmt, scale_od_flag, audio_name=None, od_override=None, hp_override=None,
+               ln_mode=ln_transform.DEFAULT_MODE, ln_density=ln_transform.DEFAULT_DENSITY, ln_gap=ln_transform.DEFAULT_GAP):
+    ln_mode, ln_density, ln_gap = ln_transform.validate_options(ln_mode, ln_density, ln_gap)
+    ln_active = ln_mode != "off"
+    validate_rate(rate, allow_original=ln_active)
+    is_original_rate = abs(float(rate) - 1.0) < 1e-9
     secs = [(n, list(l)) for n, l in sections]
     gen, meta, diff, timing = sec(secs, "General"), sec(secs, "Metadata"), sec(secs, "Difficulty"), sec(secs, "TimingPoints")
     orig_bpm = main_bpm(timing)
     orig_ver = kv(meta, "Version") or "Unknown"
     audio = kv(gen, "AudioFilename") or "audio.mp3"
-    new_audio = audio_name or f"{os.path.splitext(audio)[0]}_{fmt_rate(rate)}x.mp3"
+    new_audio = audio_name or (audio if is_original_rate else f"{os.path.splitext(audio)[0]}_{fmt_rate(rate)}x.mp3")
 
     if od_override is not None:
         value = float(od_override)
         if not math.isfinite(value) or not 0 <= value <= 10:
             raise ValueError("OD must be between 0 and 10")
         set_kv(diff, "OverallDifficulty", format(value, "g"))
-    elif scale_od_flag and kv(diff, "OverallDifficulty") is not None:
+    elif scale_od_flag and not is_original_rate and kv(diff, "OverallDifficulty") is not None:
         set_kv(diff, "OverallDifficulty", scale_od(kv(diff, "OverallDifficulty"), rate))
 
     if hp_override is not None:
@@ -691,14 +700,16 @@ def build_rate(header, sections, rate, fmt, scale_od_flag, audio_name=None, od_o
             raise ValueError("HP must be between 0 and 10")
         set_kv(diff, "HPDrainRate", format(value, "g"))
 
-    new_ver = format_version(fmt, orig_ver, rate, orig_bpm, kv(diff, "OverallDifficulty") or "?")
+    ln_tag = ln_transform.mode_tag(ln_mode, ln_density, ln_gap)
+    new_ver = format_version(fmt, orig_ver, rate, orig_bpm, kv(diff, "OverallDifficulty") or "?", ln=ln_tag)
     set_kv(gen, "AudioFilename", new_audio)
-    prev = kv(gen, "PreviewTime")
-    if prev and prev != "-1":
-        set_kv(gen, "PreviewTime", tm(prev, rate))
-    lead = kv(gen, "AudioLeadIn")
-    if lead:
-        set_kv(gen, "AudioLeadIn", tm(lead, rate))
+    if not is_original_rate:
+        prev = kv(gen, "PreviewTime")
+        if prev and prev != "-1":
+            set_kv(gen, "PreviewTime", tm(prev, rate))
+        lead = kv(gen, "AudioLeadIn")
+        if lead:
+            set_kv(gen, "AudioLeadIn", tm(lead, rate))
     set_kv(meta, "Version", new_ver)
     set_kv(meta, "BeatmapID", "0")
     tags = kv(meta, "Tags") or ""
@@ -706,16 +717,26 @@ def build_rate(header, sections, rate, fmt, scale_od_flag, audio_name=None, od_o
 
     editor = sec(secs, "Editor")
     bm = kv(editor, "Bookmarks")
-    if bm:
+    if bm and not is_original_rate:
         set_kv(editor, "Bookmarks", ",".join(tm(x, rate) for x in bm.split(",") if x.strip()))
 
+    raw_timing = list(timing)
+    raw_events = list(sec(secs, "Events"))
+    keys = float(kv(diff, "CircleSize") or 4)
     for n, l in secs:
         if n == "TimingPoints":
-            l[:] = scale_timing(l, rate)
+            if not is_original_rate:
+                l[:] = scale_timing(l, rate)
         elif n == "Events":
-            l[:] = scale_events(l, rate)
+            if not is_original_rate:
+                l[:] = scale_events(l, rate)
         elif n == "HitObjects":
-            l[:] = scale_objects(l, rate)
+            if ln_active:
+                l[:] = ln_transform.transform_hit_objects(
+                    l, raw_timing, keys=keys, mode=ln_mode, density=ln_density, gap=ln_gap, event_lines=raw_events
+                )
+            if not is_original_rate:
+                l[:] = scale_objects(l, rate)
 
     text = header + "\r\n"
     for n, l in secs:
@@ -723,8 +744,8 @@ def build_rate(header, sections, rate, fmt, scale_od_flag, audio_name=None, od_o
     return text, new_ver, audio, new_audio
 
 
-def validate_rate(rate):
-    if not math.isfinite(rate) or not 0.1 <= rate <= 5 or rate == 1:
+def validate_rate(rate, allow_original=False):
+    if not math.isfinite(rate) or not 0.1 <= rate <= 5 or (not allow_original and rate == 1):
         raise ValueError("Rate must be finite, between 0.1 and 5, and different from 1.")
 
 
@@ -855,7 +876,10 @@ def _migrate_audio_sidecars(folder, log):
     log(f"        migrated {len(migrated)} audio record(s) to the user cache")
 
 
-def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp_override=None, result=None, bitrate=DEFAULT_BITRATE):
+def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp_override=None, result=None, bitrate=DEFAULT_BITRATE,
+             ln_mode=ln_transform.DEFAULT_MODE, ln_density=ln_transform.DEFAULT_DENSITY, ln_gap=ln_transform.DEFAULT_GAP):
+    ln_mode, ln_density, ln_gap = ln_transform.validate_options(ln_mode, ln_density, ln_gap)
+    ln_active = ln_mode != "off"
     path = info["path"]
     folder = os.path.dirname(os.path.abspath(path))
     header, sections = parse_osu(path)
@@ -869,19 +893,21 @@ def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp
         raise FileNotFoundError(f"Source audio missing: {audio}")
     rates = list(dict.fromkeys(rates))
     for rate in rates:
-        validate_rate(rate)
+        validate_rate(rate, allow_original=ln_active)
+    has_scaled_rate = any(abs(float(r) - 1.0) >= 1e-9 for r in rates)
     # Stable automatically loads shared .osb files for every difficulty.
     # Scaling that shared file would damage originals; fail rather than
     # silently produce a desynchronized storyboard.
-    if any(name.lower().endswith(".osb") for name in os.listdir(folder)):
-        raise ValueError("External .osb storyboards are not supported safely. "
-                         "Use a separate copy of the beatmap set without the .osb file.")
     events = sec(sections, "Events")
-    if any(re.match(r"\s*(?:1|Video)\s*,", line) for line in events):
-        raise ValueError("Video playback cannot be rate-scaled by timestamp edits. "
-                         "Use a separate copy of the set without its video event.")
-    if sec(sections, "Variables") or any("$" in line for line in events):
-        raise ValueError("Storyboard variables are not supported; expand them before generating rates.")
+    if has_scaled_rate:
+        if any(name.lower().endswith(".osb") for name in os.listdir(folder)):
+            raise ValueError("External .osb storyboards are not supported safely. "
+                             "Use a separate copy of the beatmap set without the .osb file.")
+        if any(re.match(r"\s*(?:1|Video)\s*,", line) for line in events):
+            raise ValueError("Video playback cannot be rate-scaled by timestamp edits. "
+                             "Use a separate copy of the set without its video event.")
+        if sec(sections, "Variables") or any("$" in line for line in events):
+            raise ValueError("Storyboard variables are not supported; expand them before generating rates.")
     _migrate_audio_sidecars(folder, log)
     audio_records = _load_audio_cache()
     source_hash = _file_digest(src_a)
@@ -891,7 +917,7 @@ def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp
 
     # MP3 encoding is single-threaded, so start every new rate's encode up front
     # and let the loop below publish them in order as each one finishes.
-    pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 1) if ffmpeg else None
+    pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 1) if (ffmpeg and has_scaled_rate) else None
     jobs = {}
 
     def start_encode(rate):
@@ -902,47 +928,64 @@ def generate(info, rates, fmt, pitch, od_flag, log, ffmpeg, od_override=None, hp
     try:
         known = {record.get("identity") for record in audio_records.values()}
         if pool:
-            jobs = {rate: start_encode(rate) for rate in rates if identity_for(rate) not in known}
+            jobs = {
+                rate: start_encode(rate)
+                for rate in rates
+                if abs(float(rate) - 1.0) >= 1e-9 and identity_for(rate) not in known
+            }
         for rate in rates:
-            identity = identity_for(rate)
-            original_stem = os.path.splitext(re.split(r"[/\\]", audio)[-1])[0]
-            audio_stem = safe_name(original_stem)[:140] or "audio"
-            preferred_audio = f"{audio_stem} x{fmt_rate(rate)} mmr"
-            # Readable names can collide between pitch modes, source revisions,
-            # or different source extensions. Verify each candidate before reuse.
-            for number in range(100000):
-                suffix = "" if number == 0 else f" ({number + 1})"
-                new_audio = f"{preferred_audio}{suffix}.mp3"
-                dst_a = os.path.join(folder, new_audio)
-                manifest_path = dst_a + ".json"
-                manifest = audio_records.get(_audio_cache_key(dst_a), {})
-                reusable = _verified_audio_record(dst_a, manifest, identity)
-                if reusable or not (os.path.exists(dst_a) or os.path.exists(manifest_path)):
-                    break
+            is_original_rate = abs(float(rate) - 1.0) < 1e-9
+            if is_original_rate:
+                new_audio = audio
+                dst_a = src_a
+                text, ver, _, _ = build_rate(
+                    header, sections, rate, fmt, od_flag, new_audio, od_override, hp_override,
+                    ln_mode=ln_mode, ln_density=ln_density, ln_gap=ln_gap,
+                )
+                log("        using original audio")
             else:
-                raise RuntimeError("Too many audio filename collisions")
-            text, ver, _, _ = build_rate(header, sections, rate, fmt, od_flag, new_audio, od_override, hp_override)
+                identity = identity_for(rate)
+                original_stem = os.path.splitext(re.split(r"[/\\]", audio)[-1])[0]
+                audio_stem = safe_name(original_stem)[:140] or "audio"
+                preferred_audio = f"{audio_stem} x{fmt_rate(rate)} mmr"
+                # Readable names can collide between pitch modes, source revisions,
+                # or different source extensions. Verify each candidate before reuse.
+                for number in range(100000):
+                    suffix = "" if number == 0 else f" ({number + 1})"
+                    new_audio = f"{preferred_audio}{suffix}.mp3"
+                    dst_a = os.path.join(folder, new_audio)
+                    manifest_path = dst_a + ".json"
+                    manifest = audio_records.get(_audio_cache_key(dst_a), {})
+                    reusable = _verified_audio_record(dst_a, manifest, identity)
+                    if reusable or not (os.path.exists(dst_a) or os.path.exists(manifest_path)):
+                        break
+                else:
+                    raise RuntimeError("Too many audio filename collisions")
+                text, ver, _, _ = build_rate(
+                    header, sections, rate, fmt, od_flag, new_audio, od_override, hp_override,
+                    ln_mode=ln_mode, ln_density=ln_density, ln_gap=ln_gap,
+                )
+                if reusable:
+                    log("        verified audio already exists, reused")
+                else:
+                    if not ffmpeg:
+                        raise RuntimeError("FFmpeg not found. Install FFmpeg and add it to PATH, then restart Jatotrainer. No beatmap was written.")
+                    # A cached record that failed verification has no prestarted job.
+                    temporary, job = jobs.pop(rate, None) or start_encode(rate)
+                    try:
+                        job.result()
+                        # Exclusive creation protects files created since the check.
+                        with open(temporary, "rb") as src, open(dst_a, "xb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        record = {"identity": identity, "sha256": _file_digest(dst_a)}
+                        _save_audio_records({_audio_cache_key(dst_a): record})
+                        audio_records[_audio_cache_key(dst_a)] = record
+                    finally:
+                        if os.path.exists(temporary):
+                            os.unlink(temporary)
+                    log(f"        audio -> {new_audio}")
             filename = safe_name(f"{info['artist']} - {info['title']} ({info['creator']}) [{ver}]")[:160]
             fname = f"{filename} [mmr-x{fmt_rate(rate)}].osu"
-            if reusable:
-                log("        verified audio already exists, reused")
-            else:
-                if not ffmpeg:
-                    raise RuntimeError("FFmpeg not found. Install FFmpeg and add it to PATH, then restart Jatotrainer. No beatmap was written.")
-                # A cached record that failed verification has no prestarted job.
-                temporary, job = jobs.pop(rate, None) or start_encode(rate)
-                try:
-                    job.result()
-                    # Exclusive creation protects files created since the check.
-                    with open(temporary, "rb") as src, open(dst_a, "xb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    record = {"identity": identity, "sha256": _file_digest(dst_a)}
-                    _save_audio_records({_audio_cache_key(dst_a): record})
-                    audio_records[_audio_cache_key(dst_a)] = record
-                finally:
-                    if os.path.exists(temporary):
-                        os.unlink(temporary)
-                log(f"        audio -> {new_audio}")
             published, created = _publish_unique(folder, fname, text)
             log(f"[{fmt_rate(rate)}x] {'wrote' if created else 'already exists'} {published}")
             output_path = os.path.join(folder, published)
@@ -1438,7 +1481,7 @@ class App(ctk.CTk):
 
         opts = ctk.CTkFrame(right, fg_color="transparent")
         opts.grid(row=9, column=0, sticky="ew", padx=18, pady=(10, 0))
-        ctk.CTkLabel(opts, text="Placeholders: {diff} {rate} {bpm} {bpm_orig} {od} {pct}",
+        ctk.CTkLabel(opts, text="Placeholders: {diff} {rate} {bpm} {bpm_orig} {od} {pct} {ln}",
                      text_color="#6a6a80", font=ctk.CTkFont(family="Poppins", size=11)).pack(anchor="w", pady=(0, 6))
         self.pitch_var = tk.BooleanVar(value=self.cfg.get("pitch", True))
         self.od_var = tk.BooleanVar(value=self.cfg.get("od", False))
@@ -1472,6 +1515,75 @@ class App(ctk.CTk):
         self.bitrate_warning.pack(anchor="w")
         self.bitrate_var.trace_add("write", lambda *_: self._update_bitrate_warning())
         self._update_bitrate_warning()
+
+        saved_ln_mode = self.cfg.get("ln_mode", ln_transform.DEFAULT_MODE)
+        if saved_ln_mode not in ln_transform.LN_MODE_LABELS:
+            saved_ln_mode = ln_transform.DEFAULT_MODE
+        saved_ln_density = self.cfg.get("ln_density", ln_transform.DEFAULT_DENSITY)
+        if saved_ln_density not in ln_transform.LN_DENSITY_LABELS:
+            saved_ln_density = ln_transform.DEFAULT_DENSITY
+        saved_ln_gap = self.cfg.get("ln_gap", ln_transform.DEFAULT_GAP)
+        if saved_ln_gap not in ln_transform.LN_GAP_LABELS:
+            saved_ln_gap = ln_transform.DEFAULT_GAP
+
+        self.ln_mode_var = tk.StringVar(value=ln_transform.LN_MODE_LABELS[saved_ln_mode])
+        self.ln_density_var = tk.StringVar(value=ln_transform.LN_DENSITY_LABELS[saved_ln_density])
+        self.ln_gap_var = tk.StringVar(value=ln_transform.LN_GAP_LABELS[saved_ln_gap])
+
+        self.ln_row = ctk.CTkFrame(opts, fg_color="transparent")
+        self.ln_row.pack(anchor="w", fill="x", pady=(8, 2))
+        ctk.CTkLabel(self.ln_row, text="Long notes").pack(side="left", padx=(0, 12))
+        self.ln_mode_seg = ctk.CTkSegmentedButton(
+            self.ln_row,
+            values=[ln_transform.LN_MODE_LABELS[k] for k in ln_transform.LN_MODES],
+            variable=self.ln_mode_var,
+            selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            fg_color="#171c2c",
+            unselected_color="#171c2c",
+            unselected_hover_color="#242d45",
+        )
+        self.ln_mode_seg.pack(side="left")
+
+        self.ln_detail_row = ctk.CTkFrame(opts, fg_color="transparent")
+        self.ln_param_label = ctk.CTkLabel(self.ln_detail_row, text="Note density")
+        self.ln_param_label.pack(side="left", padx=(0, 12))
+        self.ln_density_menu = ctk.CTkOptionMenu(
+            self.ln_detail_row,
+            values=[ln_transform.LN_DENSITY_LABELS[k] for k in ln_transform.LN_DENSITIES],
+            variable=self.ln_density_var,
+            width=130,
+            fg_color="#171c2c",
+            button_color="#242d45",
+        )
+        self.ln_gap_menu = ctk.CTkOptionMenu(
+            self.ln_detail_row,
+            values=[ln_transform.LN_GAP_LABELS[k] for k in ln_transform.LN_GAPS],
+            variable=self.ln_gap_var,
+            width=130,
+            fg_color="#171c2c",
+            button_color="#242d45",
+        )
+        self.use_1x_btn = ctk.CTkButton(
+            self.ln_detail_row,
+            text="1× speed",
+            width=80,
+            height=28,
+            fg_color="#171c2c",
+            hover_color="#242d45",
+            command=self.toggle_original_rate,
+        )
+        self.ln_hint = ctk.CTkLabel(
+            opts,
+            text="",
+            text_color="#8992a6",
+            anchor="w",
+            justify="left",
+            wraplength=520,
+            font=ctk.CTkFont(family="Poppins", size=11),
+        )
+        for var in (self.ln_mode_var, self.ln_density_var, self.ln_gap_var):
+            var.trace_add("write", lambda *_: self.on_options_changed())
 
         self.gen_btn = ctk.CTkButton(self.conversion_dock, text="Create rates", height=44, corner_radius=22, border_width=1, border_color="#78a8ff", fg_color=ACCENT,
                                      hover_color=ACCENT_HOVER, font=ctk.CTkFont(family="Poppins", size=15, weight="bold"),
@@ -1896,10 +2008,15 @@ class App(ctk.CTk):
                     card_od = format(self._od_override(), "g")
                 except ValueError:
                     card_od = "?"
-            for text in (f"{m['keys']}K",f"{m['bpm']} BPM",f"OD {card_od}"):
-                width=max(58,badge_font.measure(text)+20)
-                draw_chart_pill(c,self._card_pills,x,badge_y,width,36,text,badge_font,"#365eae","#80a4ff")
-                x+=width+8
+            badges = [f"{m['keys']}K", f"{m['bpm']} BPM", f"OD {card_od}"]
+            ln_tag = ln_transform.mode_tag(*self._ln_settings()) if hasattr(self, "ln_mode_var") else ""
+            if ln_tag:
+                badges.append(ln_tag)
+            for idx, text in enumerate(badges):
+                width = max(58, badge_font.measure(text) + 20)
+                fill, outline = ("#7c5ce6", "#a58bff") if idx == 3 else ("#365eae", "#80a4ff")
+                draw_chart_pill(c, self._card_pills, x, badge_y, width, 36, text, badge_font, fill, outline)
+                x += width + 8
         c.create_text(22,label_y,text="Rates being created:" if rates else "Choose or enter rates below",
                       fill="white",anchor="nw",font=("Poppins",13))
         for i,rate in enumerate(rates):
@@ -1913,16 +2030,56 @@ class App(ctk.CTk):
         cur = [x for x in cur if abs(x - val) > 1e-9] if any(abs(x - val) < 1e-9 for x in cur) else sorted(cur + [val])
         self.rates_var.set(", ".join(fmt_rate(x) for x in cur))
 
+    def _ln_settings(self):
+        mode = ln_transform.LN_LABEL_TO_MODE.get(self.ln_mode_var.get(), ln_transform.DEFAULT_MODE)
+        density = ln_transform.LN_LABEL_TO_DENSITY.get(self.ln_density_var.get(), ln_transform.DEFAULT_DENSITY)
+        gap = ln_transform.LN_LABEL_TO_GAP.get(self.ln_gap_var.get(), ln_transform.DEFAULT_GAP)
+        return mode, density, gap
+
+    def _ln_active(self):
+        return self._ln_settings()[0] != "off"
+
+    def toggle_original_rate(self):
+        cur = self.parse_rates(silent=True)
+        cur = [x for x in cur if abs(x - 1.0) > 1e-9] if any(abs(x - 1.0) < 1e-9 for x in cur) else sorted(cur + [1.0])
+        self.rates_var.set(", ".join(fmt_rate(x) for x in cur))
+
+    def _update_ln_controls(self):
+        if not hasattr(self, "ln_detail_row"):
+            return
+        mode, _, _ = self._ln_settings()
+        self.ln_density_menu.pack_forget()
+        self.ln_gap_menu.pack_forget()
+        self.use_1x_btn.pack_forget()
+        if mode == "off":
+            self.ln_detail_row.pack_forget()
+            self.ln_hint.pack_forget()
+            return
+        self.ln_detail_row.pack(anchor="w", fill="x", pady=(6, 2), after=self.ln_row)
+        if mode == "ln_to_notes":
+            self.ln_param_label.configure(text="Note density")
+            self.ln_density_menu.pack(side="left")
+            self.ln_hint.configure(text="Head only strips holds to single taps; beat snaps fill holds with tap notes. 1× speed is allowed.")
+        else:
+            self.ln_param_label.configure(text="Release gap")
+            self.ln_gap_menu.pack(side="left")
+            self.ln_hint.configure(text="Extends tap notes into holds, leaving the chosen beat gap before the next note in the same column. 1× speed is allowed.")
+        has_1x = any(abs(x - 1.0) < 1e-9 for x in self._split_rates()[0])
+        self.use_1x_btn.configure(fg_color="#b88925" if has_1x else "#171c2c", hover_color="#d0a341" if has_1x else "#242d45")
+        self.use_1x_btn.pack(side="left", padx=(10, 0))
+        self.ln_hint.pack(anchor="w", after=self.ln_detail_row)
+
     def _split_rates(self):
         """Return (valid rates, ignored tokens) from the rates box."""
+        allow_1x = self._ln_active() if hasattr(self, "ln_mode_var") else False
         out, ignored = [], []
         for tok in re.split(r"[,\s;]+", self.rates_var.get().strip()):
             if not tok:
                 continue
             try:
                 v = float(tok.rstrip("xX"))
-                if 0.1 <= v <= 5 and abs(v - 1) > 1e-9:
-                    out.append(v)
+                if 0.1 <= v <= 5 and (allow_1x or abs(v - 1) > 1e-9):
+                    out.append(1.0 if abs(v - 1) <= 1e-9 else v)
                     continue
             except ValueError:
                 pass
@@ -1943,7 +2100,8 @@ class App(ctk.CTk):
 
     def add_slider_rate(self):
         rates = self.parse_rates(silent=True)
-        if abs(self.rate_slider_value - 1) > 1e-9 and not any(abs(x - self.rate_slider_value) < 1e-9 for x in rates):
+        allow_1x = self._ln_active() if hasattr(self, "ln_mode_var") else False
+        if (allow_1x or abs(self.rate_slider_value - 1) > 1e-9) and not any(abs(x - self.rate_slider_value) < 1e-9 for x in rates):
             self.rates_var.set(", ".join(fmt_rate(x) for x in sorted(rates + [self.rate_slider_value])))
 
     def _bitrate(self):
@@ -1954,8 +2112,10 @@ class App(ctk.CTk):
                                        if self._bitrate() > DEFAULT_BITRATE else "")
 
     def on_options_changed(self):
+        self._update_ln_controls()
         rates, ignored = self._split_rates()
-        self.rates_warning.configure(text=f"Ignored: {', '.join(ignored)} (rates must be 0.1–5 and not 1, use a dot for decimals)" if ignored else "")
+        rule = "rates must be 0.1–5" if self._ln_active() else "rates must be 0.1–5 and not 1"
+        self.rates_warning.configure(text=f"Ignored: {', '.join(ignored)} ({rule}, use a dot for decimals)" if ignored else "")
         self._update_rate_slider_label()
         self._draw_chart_card()
         for r, b in self.chip_btns.items():
@@ -1967,7 +2127,10 @@ class App(ctk.CTk):
             m = self.selected or dict(version="Insane", bpm=180, od="8")
             od = m.get("od", "8")
             override = self._od_override()
-            names = [format_version(self.fmt_var.get(), m["version"], r, float(m["bpm"]), override if override is not None else scale_od(od, r) if self.od_var.get() else od)
+            ln_tag = ln_transform.mode_tag(*self._ln_settings()) if hasattr(self, "ln_mode_var") else ""
+            names = [format_version(self.fmt_var.get(), m["version"], r, float(m["bpm"]),
+                                    override if override is not None else scale_od(od, r) if self.od_var.get() else od,
+                                    ln=ln_tag)
                      for r in (rates[:3] or [sample])]
             self.preview.configure(text="Preview:  " + "   |   ".join(names), text_color=ACCENT)
         except (KeyError, IndexError, ValueError) as e:
@@ -1981,7 +2144,19 @@ class App(ctk.CTk):
         if not rates or not m or self.busy:
             return
         override = self._od_override()
-        self.cfg.update(od_override_enabled=self.od_override_enabled.get(), od_override=self.od_override_value.get(), format=self.fmt_var.get(), pitch=self.pitch_var.get(), od=self.od_var.get(), bitrate=self._bitrate(), rates=self.rates_var.get())
+        ln_mode, ln_density, ln_gap = self._ln_settings()
+        self.cfg.update(
+            od_override_enabled=self.od_override_enabled.get(),
+            od_override=self.od_override_value.get(),
+            format=self.fmt_var.get(),
+            pitch=self.pitch_var.get(),
+            od=self.od_var.get(),
+            bitrate=self._bitrate(),
+            rates=self.rates_var.get(),
+            ln_mode=ln_mode,
+            ln_density=ln_density,
+            ln_gap=ln_gap,
+        )
         save_json(CONFIG_PATH, self.cfg)
         self.busy = True
         self.gen_btn.configure(state="disabled", text="Creating rates…")
@@ -1995,7 +2170,11 @@ class App(ctk.CTk):
         def work():
             outputs = []
             try:
-                for n, _ in enumerate(generate(m, rates, fmt, pitch, odf, lambda s: self.q.put(("log", s)), ff, override, hp, result=outputs.append, bitrate=br), 1):
+                for n, _ in enumerate(generate(
+                    m, rates, fmt, pitch, odf, lambda s: self.q.put(("log", s)), ff, override, hp,
+                    result=outputs.append, bitrate=br,
+                    ln_mode=ln_mode, ln_density=ln_density, ln_gap=ln_gap,
+                ), 1):
                     self.q.put(("prog", n / len(rates)))
                 self.q.put(("done", len(rates), outputs))
             except Exception as e:
