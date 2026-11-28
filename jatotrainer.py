@@ -43,7 +43,7 @@ BG_MAIN = "#080a12"
 
 LIST_LIMIT = 3000  # max rows shown in the list (search/auto-select narrows it)
 # Shown in the header; keep in step with the installer default in installer.iss.
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 DEFAULT_FORMAT = "{diff} ({rate}x)"
 # osu! ranking criteria cap MP3 at 192 kbps; higher bitrates bloat uploads past Bancho's size limit.
 DEFAULT_BITRATE = 192

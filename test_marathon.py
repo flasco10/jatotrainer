@@ -114,7 +114,7 @@ class MarathonBuildTests(unittest.TestCase):
         hold = core.sec(sections, "HitObjects")[2]
         self.assertTrue(hold.endswith("2800:0:0:0:0:"), hold)  # custom hitsound file dropped
         timing = [int(line.split(",")[0]) for line in core.sec(sections, "TimingPoints")]
-        self.assertEqual(timing, [0, 4984])  # -20 ms at 1.25x is -16 ms before song B
+        self.assertEqual(timing, [0, 4984, 4984])  # -20 ms at 1.25x is -16 ms before song B; + its scroll fix
         self.assertEqual(core.kv(core.sec(sections, "Editor"), "Bookmarks"), "0,5000")
         self.assertEqual(core.kv(core.sec(sections, "Difficulty"), "OverallDifficulty"), "8")
         self.assertEqual(core.kv(core.sec(sections, "Difficulty"), "CircleSize"), "4")
@@ -133,6 +133,50 @@ class MarathonBuildTests(unittest.TestCase):
         _, sections = core.parse_osu_text(osu)
         # A's last note at 2000, B's first at 7000 + 1000.
         self.assertIn("2,3000,7000", core.sec(sections, "Events"))
+
+    def test_long_intro_and_outro_are_skipped(self):
+        # A: 10 s of audio, notes only at 6-7 s. Keeps 2 s before (from 4 s) and 1 s after (to 8 s).
+        a = self.make_set("A", 10.0, "red", notes=(6000, 7000))
+        b = self.make_set("B", 6.0, "blue", notes=(4500, 5000), timing="0,500,4,1,0,100,1,0")
+        folder, offsets = self.build([dict(path=a, break_after=2), dict(path=b)])
+        self.assertEqual(offsets, [0, 6000])  # 4 s of A + 2 s break, not 10 s + 2 s
+        _, sections = core.parse_osu_text(next(Path(folder).glob("*.osu")).read_text(encoding="utf-8"))
+        times = [int(line.split(",")[2]) for line in core.sec(sections, "HitObjects")]
+        self.assertEqual(times, [2000, 3000, 8000, 8500])  # B cut from 2.5 s: 6000 + (4500|5000 - 2500)
+        timing = [int(line.split(",")[0]) for line in core.sec(sections, "TimingPoints")]
+        self.assertEqual(timing, [0, 3500])  # B's 0 ms point moves with B's notes, so beats stay on the grid
+        self.assertEqual(core.kv(core.sec(sections, "General"), "PreviewTime"), "0")  # 1000 was cut away
+        audio = mb.subprocess.run([shutil.which("ffmpeg"), "-i", str(Path(folder) / "audio.mp3")],
+                                  capture_output=True, text=True).stderr
+        h, m, s = audio.split("Duration: ")[1].split(",")[0].split(":")
+        self.assertAlmostEqual(float(s) + 60 * int(m), 9.5, delta=0.15)  # 4 + 2 + 3.5 s
+
+    def test_each_song_keeps_its_own_scroll_speed(self):
+        # A: 120 BPM and longest, so the marathon's main BPM. B: 240 BPM with its own 1.5x SV section.
+        a = self.make_set("A", 6.0, "red", notes=(1000, 5000), timing="0,500,4,1,0,100,1,0")
+        b = self.make_set("B", 3.0, "blue", notes=(500, 2500),
+                          timing="0,250,4,1,0,100,1,0\n1000,-66.6666666667,4,1,0,100,0,0")
+        folder, _ = self.build([dict(path=a), dict(path=b)])
+        _, sections = core.parse_osu_text(next(Path(folder).glob("*.osu")).read_text(encoding="utf-8"))
+        points = [line.split(",")[:2] for line in core.sec(sections, "TimingPoints")]
+        a_points, b_points = points[:1], points[1:]
+        self.assertEqual(a_points, [["0", "500"]])  # A is the main BPM: untouched
+        # B: red point gets a 0.5x green (250/500), and its 1.5x section becomes 0.75x.
+        self.assertEqual([p[0] for p in b_points], ["6000", "6000", "7000"])
+        self.assertEqual(float(b_points[0][1]), 250)
+        self.assertAlmostEqual(-100 / float(b_points[1][1]), 0.5)
+        self.assertAlmostEqual(-100 / float(b_points[2][1]), 0.75)
+
+    def test_main_beat_is_longest_lasting(self):
+        lines = ["0,500,4,1,0,100,1,0", "1000,-50,4,1,0,100,0,0", "2000,250,4,1,0,100,1,0"]
+        self.assertEqual(mb._main_beat(lines, 10000), 250)  # 8 s at 250 vs 2 s at 500
+        self.assertEqual(mb._main_beat(lines, 3000), 500)
+
+    def test_trim_off_keeps_full_audio(self):
+        a = self.make_set("A", 10.0, "red", notes=(6000, 7000))
+        b = self.make_set("B", 2.0, "blue")
+        _, offsets = self.build([dict(path=a, break_after=2), dict(path=b)], trim=False)
+        self.assertEqual(offsets, [0, 12000])
 
     def test_rejects_mixed_key_counts_without_writing(self):
         a = self.make_set("A", 1.0, "red")

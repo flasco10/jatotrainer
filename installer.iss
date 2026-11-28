@@ -1,7 +1,7 @@
 #define AppName "jatotrainer"
 ; CI passes /DAppVersion=<tag>; local builds use this default.
 #ifndef AppVersion
-  #define AppVersion "1.6.0"
+  #define AppVersion "1.6.1"
 #endif
 
 [Setup]
