@@ -14,6 +14,8 @@ from pack_backend import background_path, plain_title, safe_source, validate_set
 
 SIZE = (1920, 1080)
 SAMPLE_RATE = 44100
+LEAD_MS = 2000  # audio kept before each song's first note when trimming
+TAIL_MS = 1000  # and after its last note
 MAX_BACKGROUND_BYTES = 2_500_000  # osu! ranking criteria background limit
 
 
@@ -203,6 +205,37 @@ def _shift_objects(lines, ms):
     return out
 
 
+def _main_beat(lines, end):
+    """The beat length (ms) that lasts longest up to `end`: what osu!mania treats as the map's 1.0x scroll BPM."""
+    reds = sorted((float(p[0]), float(p[1])) for p in (l.split(",") for l in lines)
+                  if len(p) > 1 and float(p[1]) > 0)
+    totals = {}
+    for (t, beat), nxt in zip(reds, [r[0] for r in reds[1:]] + [end]):
+        totals[beat] = totals.get(beat, 0) + max(0, min(nxt, end) - t)
+    return max(totals, key=lambda b: (totals[b], -b)) if reds else None
+
+
+def _rescale_scroll(lines, factor):
+    """Multiply a song's scroll speed by `factor` so it keeps its own feel under the marathon's main BPM."""
+    if abs(factor - 1) < 1e-9:
+        return lines
+    sv = lambda value: f"{-100 / min(10.0, max(0.01, value)):.12g}"  # osu! caps SV at 0.01x-10x
+    green_times = {l.split(",")[0] for l in lines if float(l.split(",")[1]) < 0}
+    out = []
+    for line in lines:
+        p = line.split(",")
+        if float(p[1]) < 0:
+            p[1] = sv(-100 / float(p[1]) * factor)
+            out.append(",".join(p))
+            continue
+        out.append(line)
+        if p[0] not in green_times:  # a red point resets SV to 1.0x, so pin it to the factor
+            green = p + ["0"] * (8 - len(p))
+            green[1], green[6] = sv(factor), "0"
+            out.append(",".join(green))
+    return out
+
+
 def _shift_breaks(core, lines, rate, ms):
     out = []
     for line in core.scale_events([l for l in lines if l.split(",")[0].strip() in ("2", "Break")], rate):
@@ -215,8 +248,14 @@ def _shift_breaks(core, lines, rate, ms):
 # --------------------------------------------------------------------------- #
 # Audio
 # --------------------------------------------------------------------------- #
-def _decode(core, ffmpeg, source, destination, rate, pitch):
+def _decode(core, ffmpeg, source, destination, rate, pitch, start_ms=0, end_ms=None):
     flt = "aresample=44100" if rate == 1 else core.rate_filter(rate, pitch) + ",aresample=44100"
+    if start_ms or end_ms is not None:
+        # Cut after the rate change, in samples, so the cut lands exactly on the chart's (rate-scaled) times.
+        flt += f",atrim=start_sample={start_ms * SAMPLE_RATE // 1000}"
+        if end_ms is not None:
+            flt += f":end_sample={end_ms * SAMPLE_RATE // 1000}"
+        flt += ",asetpts=PTS-STARTPTS"
     cmd = [ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-i", str(source), "-map", "0:a:0", "-vn",
            "-filter:a", flt, "-ac", "2", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", "-f", "wav", str(destination)]
     flags = 0x08000000 if sys.platform == "win32" else 0
@@ -250,7 +289,7 @@ def _join_wavs(parts, destination):
 # Marathon
 # --------------------------------------------------------------------------- #
 def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=192, version="Marathon",
-                   weights=None, rows=None, gap=4, per_row=4, focus=None, report=lambda *args: None):
+                   weights=None, rows=None, gap=4, per_row=4, focus=None, report=lambda *args: None, trim=True):
     """Create Songs/<Various Artists - name>/ with one .osu, audio.mp3 and a collage background.
 
     entries: dicts with path, rate, pitch, break_after (seconds of silence after that song)
@@ -296,8 +335,15 @@ def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=
             bg = entry.get("background") or background_path(core, {"path": str(path)})
         except ValueError:
             bg = None
+        cut_start, cut_end = 0, None
+        if trim:
+            # Skip long intros/outros: keep LEAD_MS before the first note and TAIL_MS after the last.
+            first, last = object_span(core, [("HitObjects", core.scale_objects(core.sec(sections, "HitObjects"), rate))])
+            cut_start = max(0, (first - LEAD_MS) // 10 * 10)  # whole 10 ms = whole samples at 44.1 kHz
+            cut_end = last + TAIL_MS
         charts.append(dict(path=path, sections=sections, title=title, artist=core.kv(meta, "Artist") or "",
-                           rate=rate, pitch=bool(entry.get("pitch", True)), break_after=brk, audio=audio, bg=bg))
+                           rate=rate, pitch=bool(entry.get("pitch", True)), break_after=brk, audio=audio, bg=bg,
+                           cut_start=cut_start, cut_end=cut_end))
 
     with tempfile.TemporaryDirectory(prefix="jatotrainer-marathon-") as temporary:
         work = Path(temporary)
@@ -306,7 +352,8 @@ def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=
         report(0.02, "Decoding songs…")
         wavs = [work / f"part{i}.wav" for i in range(len(charts))]
         with ThreadPoolExecutor(max_workers=min(len(charts), 8)) as pool:
-            jobs = [pool.submit(_decode, core, ffmpeg, c["audio"], wav, c["rate"], c["pitch"]) for c, wav in zip(charts, wavs)]
+            jobs = [pool.submit(_decode, core, ffmpeg, c["audio"], wav, c["rate"], c["pitch"], c["cut_start"], c["cut_end"])
+                    for c, wav in zip(charts, wavs)]
             for done, job in enumerate(jobs, 1):
                 job.result()
                 report(0.02 + 0.5 * done / len(jobs), f"Decoded {done}/{len(jobs)} songs")
@@ -319,15 +366,22 @@ def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=
                         bitrate=bitrate, allow_original=True)
 
         report(0.85, "Merging charts…")
-        timing, objects, breaks, spans = [], [], [], []
-        for i, (chart, offset) in enumerate(zip(charts, offsets)):
+        song_timing, objects, breaks, spans = [], [], [], []
+        for i, (chart, song_start) in enumerate(zip(charts, offsets)):
             sections, rate = chart["sections"], chart["rate"]
+            offset = song_start - chart["cut_start"]  # the cut intro is missing from the audio
             floor = spans[-1][1] + 1 if spans else 0
-            timing += _shift_timing(core.scale_timing(core.sec(sections, "TimingPoints"), rate), offset, floor)
+            song_timing.append(_shift_timing(core.scale_timing(core.sec(sections, "TimingPoints"), rate), offset, floor))
             shifted = _shift_objects(core.scale_objects(core.sec(sections, "HitObjects"), rate), offset)
             objects += shifted
             breaks += _shift_breaks(core, core.sec(sections, "Events"), rate, offset)
             spans.append(object_span(core, [("HitObjects", shifted)]))
+        # osu!mania scrolls relative to the whole map's main BPM; scale each song so it scrolls as it does alone.
+        timing = []
+        main = _main_beat([l for lines in song_timing for l in lines], spans[-1][1])
+        for lines, (_, end) in zip(song_timing, spans):
+            own = _main_beat(lines, end)
+            timing += _rescale_scroll(lines, own / main) if own and main else lines
         for (_, end), (start, _) in zip(spans, spans[1:]):
             # Mark the gap between songs as a break when it is long enough to be one.
             if start - end >= 3000:
@@ -349,7 +403,10 @@ def build_marathon(core, songs, name, creator, od, hp, entries, ffmpeg, bitrate=
 
         first = charts[0]["sections"]
         preview = core.kv(core.sec(first, "General"), "PreviewTime")
-        preview = core.tm(preview, charts[0]["rate"]) if preview and preview != "-1" else "-1"
+        if preview and preview != "-1":
+            preview = str(max(0, int(core.tm(preview, charts[0]["rate"])) - charts[0]["cut_start"]))
+        else:
+            preview = "-1"
         titles = " ".join(dict.fromkeys(c["title"] for c in charts))
         artists = " ".join(dict.fromkeys(c["artist"] for c in charts if c["artist"]))
         tags = " ".join(f"{titles} {artists} marathon jatotrainer".split())
