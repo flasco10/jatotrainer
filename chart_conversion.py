@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 from zipfile import ZipFile, ZIP_DEFLATED
+from mapper_avatar import mapper_cdtitle
 import simfile
 from simfile.notes import Note, NoteData, NoteType
 from simfile.notes.group import group_notes
@@ -84,6 +85,15 @@ def catalog(core, source, direction):
                 if info: result.append(dict(info, index=0, format='osu!', meter=''))
         except Exception as error: errors.append(f'{path.name}: {error}')
     return result, errors
+
+
+def preview_background(core, info):
+    path = Path(info['path'])
+    if path.suffix.lower() == '.osu':
+        _, sections = core.parse_osu(str(path))
+        return osu_background(core, sections, path.parent)
+    song = simfile.open(str(path))
+    return asset(path.parent, song.get('BACKGROUND') or song.get('JACKET') or song.get('BANNER'))
 
 
 def ensure_objects(objects):
@@ -255,9 +265,18 @@ def osu_to_sm(core, info, rate=1, strict=True, meter=12, approximate=False):
     times=[p[0] for p in points]; beats=[0.]
     for i in range(1,len(points)):
         beats.append(beats[-1]+(points[i][0]-points[i-1][0])*points[i-1][1]/60)
+    # Native StepMania also rounds BPM changes to ticks. Compute note rows
+    # against that exported timeline so BPM rounding cannot accumulate drift.
+    grid = sorted({Beat(b).round_to_tick(): (bpm, meter)
+                   for b, (_, bpm, meter) in zip(beats, points)}.items())
+    grid_times = [anchor]
+    for (previous, (bpm, _)), (tick, _) in zip(grid, grid[1:]):
+        grid_times.append(grid_times[-1] + float(tick-previous)*60/bpm)
+
     def beat_at(t):
-        i=max(0,bisect_right(times,t)-1)
-        return Beat(beats[i]+(t-times[i])*points[i][1]/60).round_to_tick()
+        i=max(0,bisect_right(grid_times,t)-1)
+        tick,(bpm,_)=grid[i]
+        return Beat(float(tick)+(t-grid_times[i])*bpm/60).round_to_tick()
     result=SSCSimfile.blank(); result['TITLE']=core.kv(md,'TitleUnicode') or core.kv(md,'Title') or info['title']
     result['TITLETRANSLIT']=core.kv(md,'Title') or info['title']
     result['ARTIST']=core.kv(md,'ArtistUnicode') or core.kv(md,'Artist') or info.get('artist','Unknown')
@@ -268,8 +287,8 @@ def osu_to_sm(core, info, rate=1, strict=True, meter=12, approximate=False):
     result['CREDIT']=core.kv(md,'Creator') or info['creator']; result['OFFSET']=f'{-anchor/rate:.9f}'
     preview=number(core.kv(general,'PreviewTime') or -1)/1000
     result['SAMPLESTART']=f'{max(0,preview/rate):.6f}'; result['SAMPLELENGTH']=f'{12/rate:.6f}'
-    result['BPMS']=','.join(f'{Beat(b).round_to_tick()}={bpm*rate:.9f}' for b,(_,bpm,_) in zip(beats,points))
-    result['TIMESIGNATURES']=','.join(f'{Beat(b).round_to_tick()}={m}=4' for b,(_,_,m) in zip(beats,points))
+    result['BPMS']=','.join(f'{Beat(b).round_to_tick()}={bpm*rate:.9f}' for b,(bpm,_) in grid)
+    result['TIMESIGNATURES']=','.join(f'{Beat(b).round_to_tick()}={m}=4' for b,(_,m) in grid)
     result['SCROLLS']=','.join(f'{beat_at(t)}={ratio:.9f}' for t,ratio in sv) or '0=1'
     notes=[]; taken=set(); pairs=[]
     for t,col,end in raw:
@@ -288,7 +307,7 @@ def osu_to_sm(core, info, rate=1, strict=True, meter=12, approximate=False):
     engine=TimingEngine(TimingData(result))
     error=max(abs(float(engine.time_at(b))-t/rate)*1000 for b,t in pairs)
     if strict and error>2:
-        raise ValueError(f'StepMania tick grid would shift judgments by up to {error:.3f} ms; allow quantization to export')
+        raise ValueError(f'StepMania tick grid would shift judgments by up to {error:.3f} ms; turn off Strict sync to export with this measured deviation')
     if error>.5: warnings.append(f'StepMania tick-grid sync deviation up to {error:.3f} ms')
     if sv: warnings.append('Mania SV exported as StepMania SCROLLS; appearance also depends on the player speed mod')
     if any(l.startswith(('1,','Video,','Sprite,','Animation,')) for l in core.sec(sections,'Events')):
@@ -300,7 +319,7 @@ def osu_to_sm(core, info, rate=1, strict=True, meter=12, approximate=False):
 
 
 def convert(core, entries, output, direction, rate=1, pitch=True, od=8, hp=5, meter=12,
-            strict=True, approximate=False, ffmpeg=None, report=lambda p,s:None):
+            strict=True, approximate=False, ffmpeg=None, report=lambda p,s:None, include_cdtitle=False):
     """Prepare complete song folders before publishing; never overwrite sources."""
     rate=number(rate,'rate'); od=number(od,'OD'); hp=number(hp,'HP')
     if not .1<=rate<=5: raise ValueError('Rate must be between 0.1 and 5')
@@ -324,8 +343,9 @@ def convert(core, entries, output, direction, rate=1, pitch=True, od=8, hp=5, me
         s=m['song']; preview=m.get('preview',s.get('SAMPLESTART'))
         key=(str(Path(m['info']['path']).parent),s.get('TITLE'),s.get('ARTIST'),
              str(m['audio']),str(m['background']),m['pad'],preview,
-             (s.get('SUBTITLE'),s.get('ORIGIN')) if m['kind']=='ssc' else m['info'].get('pack'))
+             (s.get('SUBTITLE'),s.get('ORIGIN'),s.get('CREDIT') if include_cdtitle else None) if m['kind']=='ssc' else m['info'].get('pack'))
         groups[key].append(m)
+    avatars = {}
     with tempfile.TemporaryDirectory(prefix='jatotrainer-convert-') as tmp:
         stage=Path(tmp)
         for index, models in enumerate(groups.values()):
@@ -383,7 +403,20 @@ def convert(core, entries, output, direction, rate=1, pitch=True, od=8, hp=5, me
                         while (folder/filename).exists():filename=f'{stem} ({n}).osu';n+=1
                         (folder/filename).write_bytes(text.encode('utf-8'))
                 else:
-                    merged=first['song']; merged.charts=[];merged['MUSIC']=media(first);merged['BACKGROUND']=bg
+                    merged=first['song']; merged.charts=[];merged['MUSIC']=media(first);merged['BACKGROUND']=bg;merged['BANNER']=bg
+                    if include_cdtitle:
+                        creator=merged['CREDIT']
+                        if creator not in avatars:
+                            try:
+                                avatars[creator]=(mapper_cdtitle(creator),None)
+                            except (OSError, ValueError, KeyError, TypeError, SyntaxError) as error:
+                                avatars[creator]=(None,str(error))
+                        image,error=avatars[creator]
+                        if image:
+                            (folder/'cdtitle.png').write_bytes(image)
+                            merged['CDTITLE']='cdtitle.png'
+                        else:
+                            warnings.append(f'{title}: mapper avatar skipped for {creator}: {error}')
                     used=set()
                     for m in models:
                         chart=m['chart']; chart['MUSIC']=media(m)
