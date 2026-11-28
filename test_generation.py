@@ -287,6 +287,52 @@ class GenerationTests(unittest.TestCase):
             second,_=m.scan_songs(songs)
         self.assertEqual(first[0]['title'], 'T')
         self.assertEqual(second[0]['title'], 'Changed')
+
+    def test_ln_transform_at_original_rate_reuses_audio_and_skips_ffmpeg(self):
+        outputs = []
+        done = list(m.generate(
+            self.info, (1.0,), '{diff} ({rate}x)', False, False, lambda s: None, None,
+            result=outputs.append, ln_mode='ln_to_notes', ln_density='1/4',
+        ))
+        self.assertEqual(done, [1.0])
+        self.assertEqual(len(outputs), 1)
+        self.assertFalse(list(self.root.glob('*.mp3')))
+        self.assertEqual(outputs[0]['version'], 'Hard (1x) [NoLN 1/4]')
+        _, sections = m.parse_osu(outputs[0]['path'])
+        self.assertEqual(m.kv(m.sec(sections, 'General'), 'AudioFilename'), 'audio.wav')
+        hits = m.sec(sections, 'HitObjects')
+        # Original tap at 1000 + LN 2000..3000 at 120 BPM in 1/4 -> 1 + 9 = 10 tap notes
+        self.assertEqual(len(hits), 10)
+        self.assertTrue(all((int(line.split(',')[3]) & 128) == 0 for line in hits))
+
+    def test_ln_transform_with_rate_scaling_and_audio_cache_reuse(self):
+        calls = []
+        with patch.object(m, 'make_audio', lambda *a, **k: (calls.append(a[3]), self.fake_audio(*a, **k))):
+            first = []
+            list(m.generate(
+                self.info, (1.25,), '{diff} ({rate}x)', False, False, lambda s: None, 'fake',
+                result=first.append, ln_mode='notes_to_ln', ln_gap='1/4',
+            ))
+            second = []
+            list(m.generate(
+                self.info, (1.25,), '{diff} ({rate}x)', False, False, lambda s: None, 'fake',
+                result=second.append, ln_mode='ln_to_notes', ln_density='head',
+            ))
+        self.assertEqual(calls, [1.25])  # second run reuses cached 1.25x audio
+        _, sec_ln = m.parse_osu(first[0]['path'])
+        hits_ln = m.sec(sec_ln, 'HitObjects')
+        # Original tap at 1000 (col 0) becomes LN 1000..1500 unscaled -> 800..1200 at 1.25x
+        self.assertIn('64,192,800,128,0,1200:', hits_ln[0])
+        self.assertIn('192,192,1600,128,0,2400:', hits_ln[1])
+        self.assertEqual(first[0]['version'], 'Hard (1.25x) [FullLN 1/4]')
+        self.assertEqual(second[0]['version'], 'Hard (1.25x) [NoLN]')
+
+    def test_ln_format_placeholder(self):
+        h, s = m.parse_osu(self.path)
+        text, ver, _, _ = m.build_rate(h, s, 1.0, '{diff} {ln} ({rate}x)', False, ln_mode='ln_to_notes', ln_density='1/4')
+        self.assertEqual(ver, 'Hard NoLN 1/4 (1x)')
+        self.assertIn('Version:Hard NoLN 1/4 (1x)', text)
+
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg or ffprobe unavailable')
     def test_real_audio_speed_and_pitch_at_both_sample_rates(self):
         # A 1 kHz sine should become 1.25 kHz in pitch mode and stay 1 kHz

@@ -82,6 +82,45 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(page.tree.cget('columns'),('song','diff','author'))
         finally:a.back_from_conversion()
 
+
+    def test_ln_controls_visibility_1x_support_and_generation_kwargs(self):
+        a = self.app
+        a.selected = dict(path='sample.osu', title='Song', artist='Artist', creator='Charter', version='Hard', bpm=180, od='8', keys=4)
+        self.assertEqual(a.ln_mode_var.get(), 'Off')
+        self.assertFalse(a.ln_detail_row.winfo_ismapped())
+        a.rates_var.set('1, 1.2')
+        self.assertEqual(a.parse_rates(), [1.2])
+
+        a.ln_mode_var.set('LN → Notes'); a.update()
+        self.assertTrue(a.ln_detail_row.winfo_ismapped())
+        self.assertTrue(a.ln_density_menu.winfo_ismapped())
+        self.assertFalse(a.ln_gap_menu.winfo_ismapped())
+        self.assertEqual(a.parse_rates(), [1.0, 1.2])
+        self.assertIn('[NoLN]', a.preview.cget('text'))
+
+        a.ln_density_var.set('1/4 beat'); a.update()
+        self.assertIn('[NoLN 1/4]', a.preview.cget('text'))
+
+        a.toggle_original_rate(); a.update()
+        self.assertEqual(a.parse_rates(), [1.2])
+        a._on_rate_slider(1.0); a.add_slider_rate(); a.update()
+        self.assertEqual(a.parse_rates(), [1.0, 1.2])
+
+        a.ln_mode_var.set('Notes → LN'); a.update()
+        self.assertTrue(a.ln_gap_menu.winfo_ismapped())
+        self.assertFalse(a.ln_density_menu.winfo_ismapped())
+        self.assertIn('[FullLN 1/4]', a.preview.cget('text'))
+        a.ln_gap_var.set('1/2 beat'); a.update()
+        self.assertIn('[FullLN 1/2]', a.preview.cget('text'))
+
+        with patch.object(j, 'generate', return_value=[]) as generate:
+            a.on_generate(); self.pump()
+            self.assertEqual(generate.call_args.kwargs['ln_mode'], 'notes_to_ln')
+            self.assertEqual(generate.call_args.kwargs['ln_density'], '1/4')
+            self.assertEqual(generate.call_args.kwargs['ln_gap'], '1/2')
+        saved = j.load_json(j.CONFIG_PATH, {})
+        self.assertEqual((saved.get('ln_mode'), saved.get('ln_density'), saved.get('ln_gap')),
+                         ('notes_to_ln', '1/4', '1/2'))
     def test_compact_mode_controls_geometry_and_return(self):
         a = self.app
         a.selected = dict(path='sample.osu', title='Song', artist='Artist', creator='Charter', version='Hard', bpm=180, od='8', keys=4)
