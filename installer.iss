@@ -38,3 +38,5 @@ Name: "{autodesktop}\jatotrainer"; Filename: "{app}\jatotrainer.exe"; WorkingDir
 
 [Run]
 Filename: "{app}\jatotrainer.exe"; Description: "Launch jatotrainer"; Flags: nowait postinstall skipifsilent
+; In-app updates install silently, so reopen the app afterwards.
+Filename: "{app}\jatotrainer.exe"; Flags: nowait; Check: WizardSilent

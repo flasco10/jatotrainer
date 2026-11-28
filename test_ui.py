@@ -54,6 +54,15 @@ class InterfaceTests(unittest.TestCase):
         self.app.bitrate_var.set('320 kbps')
         self.assertEqual(self.app._bitrate(),320)
         self.assertIn('Bancho',self.app.bitrate_warning.cget('text'))
+    def test_update_button_appears_and_portable_opens_page(self):
+        a=self.app
+        self.assertFalse(a.update_btn.winfo_ismapped())
+        a.show_update(dict(version='9.0.0',page='https://example/rel',size=0));a.update()
+        self.assertTrue(a.update_btn.winfo_ismapped())
+        self.assertEqual(a.update_btn.cget('text'),'Update to v9.0.0')
+        with patch.object(j.webbrowser,'open') as opened:
+            a.start_update()  # running from source = not installed
+        opened.assert_called_once_with('https://example/rel')
     def test_converter_follows_when_main_follow_is_off(self):
         from test_generation import MAP
         a=self.app

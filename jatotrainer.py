@@ -23,6 +23,7 @@ from tkinter import filedialog, ttk
 
 from ffmpeg_setup import DOWNLOAD_URL, EXE_NAME, install_ffmpeg, managed_ffmpeg_path
 import osu_db
+import updater
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
@@ -1045,6 +1046,65 @@ class App(ctk.CTk):
                 msg += "\nNote: osu!lazer stores maps differently and isn't supported; this tool needs osu!stable."
             self.status.configure(text=msg)
         self.update_follow_worker()
+        if getattr(sys, "frozen", False) and not self.cfg.get("disable_update_check"):
+            threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self):
+        try:
+            found = updater.check_for_update(APP_VERSION)
+        except Exception:
+            return  # offline or rate-limited: just try again next launch
+        if found:
+            self.q.put(("call", lambda: self.show_update(found)))
+
+    def show_update(self, update):
+        self.available_update = update
+        self.update_btn.configure(text=f"Update to v{update['version']}", state="normal")
+        self.update_btn.pack(side="left")
+
+    def start_update(self):
+        from tkinter import messagebox
+        update = self.available_update
+        if not update or self.update_btn.cget("state") == "disabled":
+            return
+        if not updater.is_installed():
+            # Portable or source copy: nothing to install over, so open the download page.
+            webbrowser.open(update["page"])
+            return
+        size = f" ({update['size'] / 1e6:.0f} MB)" if update.get("size") else ""
+        if self.busy:
+            messagebox.showinfo(APP_NAME, "Wait for the current job to finish, then update.", parent=self)
+            return
+        if not messagebox.askyesno(APP_NAME, f"Download and install jatotrainer v{update['version']}{size}?\n\n"
+                                   "jatotrainer will close, update and reopen by itself.", parent=self):
+            return
+        self.update_btn.configure(state="disabled", text="Downloading…")
+
+        def progress(fraction):
+            self.q.put(("call", lambda: self.update_btn.configure(text=f"Downloading {fraction:.0%}")))
+
+        def work():
+            try:
+                path = updater.download_update(update, progress)
+            except Exception as e:
+                self.q.put(("call", lambda e=e: self._update_failed(e)))  # `e` is cleared after except
+                return
+            self.q.put(("call", lambda: self._install_update(path)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_failed(self, error):
+        from tkinter import messagebox
+        self.update_btn.configure(state="normal", text=f"Update to v{self.available_update['version']}")
+        if messagebox.askyesno(APP_NAME, f"Update failed: {error}\n\nOpen the download page instead?", parent=self):
+            webbrowser.open(self.available_update["page"])
+
+    def _install_update(self, path):
+        try:
+            updater.run_installer(path)
+        except OSError as e:
+            self._update_failed(e)
+            return
+        self.destroy()
 
     def show_initial_setup(self):
         dialog = self._setup_dialog = ctk.CTkToplevel(self)
@@ -1192,6 +1252,10 @@ class App(ctk.CTk):
         ctk.CTkLabel(brand, text="jatotrainer", font=ctk.CTkFont(family="Poppins", size=19, weight="bold")).pack(side="left")
         ctk.CTkLabel(brand, text=f"v{APP_VERSION}", width=56, height=24, fg_color="#15243e",
                      corner_radius=12, text_color="#8eb6ff", font=ctk.CTkFont(family="Poppins", size=11)).pack(side="left", padx=10)
+        self.update_btn = ctk.CTkButton(brand, text="", height=26, corner_radius=13, fg_color="#2f7d4a",
+                                        hover_color="#3b9a5c", font=ctk.CTkFont(family="Poppins", size=11, weight="bold"),
+                                        command=self.start_update)  # packed only when an update exists
+        self.available_update = None
         self.pack_btn = ctk.CTkButton(header, text="Pack maker", width=105, height=36,
                                       fg_color="#131a2a", hover_color="#202b40", corner_radius=18,
                                       border_width=1, border_color="#293147", command=self.open_pack_maker)
@@ -1950,7 +2014,9 @@ class App(ctk.CTk):
             while True:
                 msg = self.q.get_nowait()
                 k = msg[0]
-                if k == "log":
+                if k == "call":  # run a worker thread's UI update on the Tk thread
+                    msg[1]()
+                elif k == "log":
                     self._log(msg[1])
                 elif k == "prog":
                     self._set_progress(msg[1])
